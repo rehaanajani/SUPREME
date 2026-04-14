@@ -32,6 +32,7 @@ from config import (
     OPENAI_API_KEY,
     QDRANT_COLLECTION,
     QDRANT_URL,
+    QDRANT_API_KEY,
     QDRANT_VECTOR_SIZE,
     EMBEDDING_MODEL,
 )
@@ -45,7 +46,11 @@ def _get_qdrant():
     from qdrant_client import QdrantClient
     from qdrant_client.models import Distance, VectorParams
 
-    client = QdrantClient(url=QDRANT_URL)
+    kwargs: dict[str, Any] = {"url": QDRANT_URL, "timeout": 10}
+    if QDRANT_API_KEY:
+        kwargs["api_key"] = QDRANT_API_KEY
+
+    client = QdrantClient(**kwargs)
 
     existing = [c.name for c in client.get_collections().collections]
     if QDRANT_COLLECTION not in existing:

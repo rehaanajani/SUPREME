@@ -39,6 +39,12 @@ SESSION_TTL: int = 86_400  # 24 hours in seconds
 APP_HOST:   str  = os.getenv("APP_HOST", "0.0.0.0")
 APP_PORT:   int  = int(os.getenv("APP_PORT", "8000"))
 DEMO_MODE:  bool = os.getenv("DEMO_MODE", "true").lower() == "true"
+APP_LOG_LEVEL: str = os.getenv("APP_LOG_LEVEL", "INFO").upper()
+ENABLE_RAG_DEBUG: bool = os.getenv("ENABLE_RAG_DEBUG", "false").lower() == "true"
+CORS_ORIGINS: list[str] = [
+    origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
+]
 
 # ── Vapi (optional voice layer) ───────────────────────────────────────────────
 VAPI_API_KEY:           str  = os.getenv("VAPI_API_KEY", "")

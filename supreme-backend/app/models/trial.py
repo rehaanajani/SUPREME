@@ -50,6 +50,22 @@ class Citation(BaseModel):
     relevance_score: float
 
 
+class ToolCallTrace(BaseModel):
+    name: str
+    status: str
+    input: dict[str, Any] = Field(default_factory=dict)
+    output: dict[str, Any] = Field(default_factory=dict)
+    error: Optional[str] = None
+
+
+class AgentDebugTrace(BaseModel):
+    runner: str
+    system_prompt: str
+    user_prompt: str
+    tool_calls: list[ToolCallTrace] = Field(default_factory=list)
+    final_output: str = ""
+
+
 class TranscriptEntry(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     agent: AgentRole
@@ -58,6 +74,7 @@ class TranscriptEntry(BaseModel):
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     citations: list[Citation] = Field(default_factory=list)
     redacted: bool = False
+    debug: Optional[AgentDebugTrace] = None
 
 
 class CaseDetails(BaseModel):

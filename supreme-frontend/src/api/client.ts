@@ -1,0 +1,138 @@
+const DEFAULT_API_BASE_URL =
+  typeof window === 'undefined'
+    ? 'http://127.0.0.1:8000'
+    : `${window.location.protocol}//${window.location.hostname}:8000`;
+
+export const API_BASE_URL =
+  (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/+$/, '') ||
+  DEFAULT_API_BASE_URL;
+
+const API_DEBUG_ENABLED = (import.meta.env.VITE_DEBUG_API as string | undefined)?.toLowerCase() === 'true';
+
+function logApiDebug(event: string, payload: Record<string, unknown>): void {
+  if (!API_DEBUG_ENABLED) return;
+  const label = `[API] ${event}`;
+  if (typeof console.groupCollapsed === 'function') {
+    console.groupCollapsed(label);
+    console.table(payload);
+    console.groupEnd();
+    return;
+  }
+  console.debug(label, payload);
+}
+
+type ApiErrorBody = {
+  detail?: unknown;
+  code?: unknown;
+  hint?: unknown;
+  request_id?: unknown;
+  debug?: unknown;
+};
+
+export class ApiError extends Error {
+  status: number;
+  details: unknown;
+  requestId?: string;
+  code?: string;
+  hint?: string;
+
+  constructor(
+    message: string,
+    status: number,
+    details?: unknown,
+    options?: { requestId?: string; code?: string; hint?: string },
+  ) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.details = details;
+    this.requestId = options?.requestId;
+    this.code = options?.code;
+    this.hint = options?.hint;
+  }
+}
+
+function joinUrl(path: string): string {
+  if (path.startsWith('http://') || path.startsWith('https://')) {
+    return path;
+  }
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  return `${API_BASE_URL}${normalizedPath}`;
+}
+
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const url = joinUrl(path);
+  const method = init?.method || 'GET';
+  const startedAt = performance.now();
+  logApiDebug('request:start', { method, url, path });
+  let response: Response;
+
+  try {
+    response = await fetch(url, {
+      headers: {
+        'Content-Type': 'application/json',
+        ...(init?.headers || {}),
+      },
+      ...init,
+    });
+  } catch (error) {
+    const latencyMs = Math.round(performance.now() - startedAt);
+    logApiDebug('request:network_error', { method, url, latencyMs, error });
+    console.error('API network failure', { method, url, error });
+    throw new ApiError(
+      `Network error while calling ${method} ${url}. Check that the backend is running and reachable.`,
+      0,
+      error,
+      { code: 'NETWORK_ERROR' },
+    );
+  }
+
+  const contentType = response.headers.get('content-type') || '';
+  const isJson = contentType.includes('application/json');
+  const body = isJson ? ((await response.json()) as ApiErrorBody | T) : await response.text();
+  const latencyMs = Math.round(performance.now() - startedAt);
+  const requestId = response.headers.get('x-request-id') || undefined;
+
+  if (!response.ok) {
+    const bodyObject = isJson && typeof body === 'object' && body ? (body as ApiErrorBody) : undefined;
+    const resolvedRequestId =
+      requestId ||
+      (typeof bodyObject?.request_id === 'string' ? bodyObject.request_id : undefined);
+    const code = typeof bodyObject?.code === 'string' ? bodyObject.code : undefined;
+    const hint = typeof bodyObject?.hint === 'string' ? bodyObject.hint : undefined;
+    const message =
+      (bodyObject && typeof bodyObject.detail === 'string' && bodyObject.detail) ||
+      `Request failed with status ${response.status}`;
+    logApiDebug('request:error', {
+      method,
+      url,
+      status: response.status,
+      latencyMs,
+      requestId: resolvedRequestId,
+      code,
+      hint,
+      body,
+    });
+    console.error('API request failed', {
+      method,
+      url,
+      status: response.status,
+      requestId: resolvedRequestId,
+      code,
+      hint,
+      body,
+    });
+    throw new ApiError(message, response.status, body, { requestId: resolvedRequestId, code, hint });
+  }
+
+  logApiDebug('request:success', {
+    method,
+    url,
+    status: response.status,
+    latencyMs,
+    requestId,
+    responseType: isJson ? 'json' : 'text',
+  });
+
+  return body as T;
+}

@@ -22,8 +22,9 @@ from config import (
     QDRANT_COLLECTION,
     EMBEDDING_MODEL,
     QDRANT_VECTOR_SIZE,
+    ENABLE_RAG_DEBUG,
 )
-from app.models.trial import AgentRole, Citation
+from app.models.trial import AgentRole, Citation, ToolCallTrace
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,13 @@ _qdrant_client: Any = None
 _openai_client: Any = None
 
 
+def _debug(event: str, **kwargs: Any) -> None:
+    if not ENABLE_RAG_DEBUG:
+        return
+    details = " ".join(f"{key}={value}" for key, value in kwargs.items())
+    logger.info("RAG_DEBUG event=%s %s", event, details)
+
+
 def _get_qdrant():
     global _qdrant_client
     if _qdrant_client is None:
@@ -44,8 +52,10 @@ def _get_qdrant():
             if QDRANT_API_KEY:
                 kwargs["api_key"] = QDRANT_API_KEY
             _qdrant_client = QdrantClient(**kwargs)
+            _debug("qdrant_client_init_ok", url=QDRANT_URL, has_api_key=bool(QDRANT_API_KEY))
         except Exception as exc:
             logger.warning("Qdrant unavailable: %s", exc)
+            _debug("qdrant_client_init_failed", error=exc)
     return _qdrant_client
 
 
@@ -55,8 +65,10 @@ def _get_openai():
         try:
             from openai import AsyncOpenAI
             _openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+            _debug("openai_client_init_ok", embedding_model=EMBEDDING_MODEL)
         except Exception as exc:
             logger.warning("OpenAI client init failed: %s", exc)
+            _debug("openai_client_init_failed", error=exc)
     return _openai_client
 
 
@@ -68,14 +80,17 @@ async def _embed(text: str) -> list[float] | None:
     """Return an embedding vector or None on failure."""
     client = _get_openai()
     if client is None:
+        _debug("embed_skipped_no_openai")
         return None
     try:
         response = await client.embeddings.create(
             input=[text], model=EMBEDDING_MODEL
         )
+        _debug("embed_ok", vector_size=len(response.data[0].embedding))
         return response.data[0].embedding
     except Exception as exc:
         logger.warning("Embedding failed: %s", exc)
+        _debug("embed_failed", error=exc)
         return None
 
 
@@ -146,7 +161,7 @@ def _keyword_search(query: str, bias_filter: str | None, top_k: int) -> list[Cit
         results.append((score, record))
 
     results.sort(key=lambda x: x[0], reverse=True)
-    return [
+    citations = [
         Citation(
             case_id=rec["case_id"],
             summary=rec["summary"],
@@ -155,6 +170,8 @@ def _keyword_search(query: str, bias_filter: str | None, top_k: int) -> list[Cit
         for score, rec in results[:top_k]
         if score > 0
     ]
+    _debug("keyword_search", bias_filter=bias_filter, hits=len(citations), query=query[:120])
+    return citations
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +200,7 @@ def _qdrant_search(
             query_filter=flt,
             limit=top_k,
         )
-        return [
+        citations = [
             Citation(
                 case_id=h.payload.get("case_id", h.id),
                 summary=h.payload.get("summary", ""),
@@ -191,8 +208,17 @@ def _qdrant_search(
             )
             for h in hits
         ]
+        _debug(
+            "qdrant_search",
+            collection=QDRANT_COLLECTION,
+            bias_filter=bias_filter,
+            hits=len(citations),
+            top_case=(citations[0].case_id if citations else "none"),
+        )
+        return citations
     except Exception as exc:
         logger.warning("Qdrant search failed: %s", exc)
+        _debug("qdrant_search_failed", collection=QDRANT_COLLECTION, error=exc)
         return []
 
 
@@ -205,6 +231,15 @@ async def retrieve_precedents(
     role: AgentRole,
     top_k: int = 3,
 ) -> list[Citation]:
+    citations, _ = await retrieve_precedents_with_trace(query, role, top_k)
+    return citations
+
+
+async def retrieve_precedents_with_trace(
+    query: str,
+    role: AgentRole,
+    top_k: int = 3,
+) -> tuple[list[Citation], ToolCallTrace]:
     """
     Retrieve legal precedents relevant to *query* for the given *role*.
 
@@ -213,14 +248,93 @@ async def retrieve_precedents(
       2. Fall back to keyword search over the built-in demo bank.
     """
     bias_filter = _BIAS_MAP.get(role)
+    _debug(
+        "retrieve_precedents_start",
+        role=role,
+        top_k=top_k,
+        has_openai_key=bool(OPENAI_API_KEY),
+        qdrant_collection=QDRANT_COLLECTION,
+    )
+
+    source = "keyword"
 
     # Attempt semantic path
     vector = await _embed(query)
     if vector:
         citations = _qdrant_search(vector, bias_filter, top_k)
         if citations:
-            return citations
+            source = "qdrant"
+            _debug("retrieve_precedents_end", source=source, hits=len(citations))
+            return citations, ToolCallTrace(
+                name="retrieve_precedents",
+                status="success",
+                input={
+                    "query": query,
+                    "role": role,
+                    "top_k": top_k,
+                    "bias_filter": bias_filter,
+                },
+                output={
+                    "source": source,
+                    "citations": [citation.model_dump() for citation in citations],
+                },
+            )
         logger.debug("Qdrant returned no results; falling back to keyword search.")
+        _debug("qdrant_empty_fallback_keyword")
 
     # Keyword fallback
-    return _keyword_search(query, bias_filter, top_k)
+    citations = _keyword_search(query, bias_filter, top_k)
+    _debug("retrieve_precedents_end", source=source, hits=len(citations))
+    return citations, ToolCallTrace(
+        name="retrieve_precedents",
+        status="success",
+        input={
+            "query": query,
+            "role": role,
+            "top_k": top_k,
+            "bias_filter": bias_filter,
+        },
+        output={
+            "source": source,
+            "citations": [citation.model_dump() for citation in citations],
+        },
+    )
+
+
+def rag_diagnostics() -> dict[str, Any]:
+    """Return current RAG runtime diagnostics for debugging."""
+    diagnostics: dict[str, Any] = {
+        "openai_api_key_set": bool(OPENAI_API_KEY),
+        "embedding_model": EMBEDDING_MODEL,
+        "qdrant_url": QDRANT_URL,
+        "qdrant_collection": QDRANT_COLLECTION,
+        "qdrant_api_key_set": bool(QDRANT_API_KEY),
+        "qdrant_client_available": False,
+        "collection_exists": False,
+        "collection_points_count": None,
+        "errors": [],
+    }
+
+    client = _get_qdrant()
+    diagnostics["qdrant_client_available"] = client is not None
+    if client is None:
+        diagnostics["errors"].append("Qdrant client unavailable.")
+        return diagnostics
+
+    try:
+        collections = client.get_collections().collections
+        names = [collection.name for collection in collections]
+        diagnostics["collections"] = names
+        diagnostics["collection_exists"] = QDRANT_COLLECTION in names
+    except Exception as exc:
+        diagnostics["errors"].append(f"Failed to list collections: {exc}")
+        return diagnostics
+
+    if diagnostics["collection_exists"]:
+        try:
+            info = client.get_collection(QDRANT_COLLECTION)
+            diagnostics["collection_points_count"] = getattr(info, "points_count", None)
+        except Exception as exc:
+            diagnostics["errors"].append(f"Failed to inspect collection '{QDRANT_COLLECTION}': {exc}")
+
+    return diagnostics
