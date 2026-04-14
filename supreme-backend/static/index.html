@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SUPREME — AI Courtroom Simulator</title>
+  <meta name="description" content="Multi-agent AI courtroom: Prosecution vs Defense vs Judge. Real-time transcript, objections, and final AI verdict." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;800&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    /* ── Reset & tokens ─────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:         #0a0a0f;
+      --surface:    #111118;
+      --surface2:   #18181f;
+      --border:     rgba(255,255,255,0.07);
+      --gold:       #c9a84c;
+      --gold-dim:   #7a6430;
+      --prose-red:  #e05252;
+      --prose-blue: #52a8e0;
+      --judge:      #b89aff;
+      --text:       #e8e8f0;
+      --muted:      #666680;
+      --radius:     12px;
+      --gap:        16px;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', sans-serif;
+      font-size: 15px;
+      line-height: 1.6;
+    }
+
+    /* ── Layout ────────────────────────────────────────────── */
+    .app {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      min-height: 100vh;
+    }
+
+    /* ── Header ─────────────────────────────────────────────── */
+    header {
+      background: linear-gradient(135deg, #0d0d14 0%, #1a1228 100%);
+      border-bottom: 1px solid var(--border);
+      padding: 18px 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .logo {
+      font-family: 'Cinzel', serif;
+      font-size: 1.6rem;
+      font-weight: 800;
+      background: linear-gradient(90deg, var(--gold), #f5d98b, var(--gold));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      letter-spacing: 2px;
+    }
+
+    .logo span { font-size: 0.75rem; display: block; letter-spacing: 4px; color: var(--muted); -webkit-text-fill-color: var(--muted); font-family: 'Inter', sans-serif; font-weight: 300; margin-top: 2px; }
+
+    .status-pill {
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 4px 14px;
+      border-radius: 50px;
+      background: rgba(201,168,76,0.12);
+      border: 1px solid var(--gold-dim);
+      color: var(--gold);
+      letter-spacing: 1px;
+      text-transform: uppercase;
+    }
+
+    /* ── Main grid ──────────────────────────────────────────── */
+    main {
+      display: grid;
+      grid-template-columns: 320px 1fr 280px;
+      gap: 0;
+      overflow: hidden;
+      height: calc(100vh - 65px);
+    }
+
+    /* ── Panel base ─────────────────────────────────────────── */
+    .panel {
+      overflow-y: auto;
+      padding: var(--gap);
+      border-right: 1px solid var(--border);
+    }
+    .panel:last-child { border-right: none; }
+    .panel h2 {
+      font-family: 'Cinzel', serif;
+      font-size: 0.78rem;
+      letter-spacing: 3px;
+      text-transform: uppercase;
+      color: var(--gold);
+      margin-bottom: 14px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    /* ── Case Setup Panel ────────────────────────────────────── */
+    #panel-setup { background: var(--surface); }
+
+    .form-group { margin-bottom: 14px; }
+    .form-group label { display: block; font-size: 0.72rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+    .form-group input,
+    .form-group textarea,
+    .form-group select {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      padding: 9px 12px;
+      font-size: 0.85rem;
+      font-family: 'Inter', sans-serif;
+      resize: none;
+      transition: border-color 0.2s;
+    }
+    .form-group input:focus,
+    .form-group textarea:focus,
+    .form-group select:focus {
+      outline: none;
+      border-color: var(--gold-dim);
+    }
+    .form-group select { cursor: pointer; }
+
+    .tag-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    .tag {
+      background: rgba(201,168,76,0.1);
+      border: 1px solid var(--gold-dim);
+      color: var(--gold);
+      border-radius: 20px;
+      padding: 2px 10px;
+      font-size: 0.75rem;
+      display: flex; align-items: center; gap: 4px;
+      cursor: default;
+    }
+    .tag .rm { cursor: pointer; opacity: 0.6; }
+    .tag .rm:hover { opacity: 1; }
+    .tag-input-row { display: flex; gap: 6px; }
+    .tag-input-row input { flex: 1; }
+    .tag-input-row button { flex-shrink: 0; }
+
+    /* ── Buttons ─────────────────────────────────────────────── */
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      padding: 9px 18px;
+      border-radius: 8px;
+      border: none;
+      font-family: 'Inter', sans-serif;
+      font-size: 0.82rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.18s;
+      letter-spacing: 0.5px;
+      white-space: nowrap;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--gold), #a07828);
+      color: #0a0a0f;
+      width: 100%;
+    }
+    .btn-primary:hover { filter: brightness(1.15); transform: translateY(-1px); }
+    .btn-primary:active { transform: translateY(0); }
+    .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+    .btn-ghost {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+    .btn-ghost:hover { border-color: var(--gold-dim); color: var(--gold); }
+
+    .btn-danger { background: rgba(224,82,82,0.15); border: 1px solid rgba(224,82,82,0.3); color: var(--prose-red); }
+    .btn-danger:hover { background: rgba(224,82,82,0.25); }
+
+    .btn-info { background: rgba(82,168,224,0.12); border: 1px solid rgba(82,168,224,0.25); color: var(--prose-blue); }
+    .btn-info:hover { background: rgba(82,168,224,0.2); }
+
+    .btn-sm { padding: 5px 12px; font-size: 0.75rem; border-radius: 6px; }
+
+    /* ── Transcript Panel ─────────────────────────────────────── */
+    #panel-transcript { background: var(--bg); }
+
+    .stage-indicator {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: var(--gap);
+      padding: 10px 14px;
+      background: var(--surface);
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+    }
+    .stage-dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background: var(--gold);
+      box-shadow: 0 0 8px var(--gold);
+      animation: pulse 2s infinite;
+      flex-shrink: 0;
+    }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .stage-text { font-size: 0.8rem; font-weight: 600; flex: 1; }
+    .agent-badge {
+      font-size: 0.68rem; font-weight: 700; padding: 2px 8px;
+      border-radius: 20px; letter-spacing: 1px; text-transform: uppercase;
+    }
+    .agent-prosecution { background: rgba(224,82,82,0.15); color: var(--prose-red); border: 1px solid rgba(224,82,82,0.3); }
+    .agent-defense     { background: rgba(82,168,224,0.15); color: var(--prose-blue); border: 1px solid rgba(82,168,224,0.3); }
+    .agent-judge       { background: rgba(184,154,255,0.15); color: var(--judge); border: 1px solid rgba(184,154,255,0.3); }
+
+    /* ── Transcript entries ───────────────────────────────────── */
+    #transcript-list { display: flex; flex-direction: column; gap: 10px; }
+
+    .entry {
+      padding: 14px 16px;
+      border-radius: var(--radius);
+      border-left: 3px solid transparent;
+      background: var(--surface);
+      animation: slideIn 0.3s ease;
+      position: relative;
+    }
+    @keyframes slideIn { from { opacity:0; transform: translateY(8px); } to { opacity:1; transform: translateY(0); } }
+
+    .entry.prosecution { border-left-color: var(--prose-red); }
+    .entry.defense     { border-left-color: var(--prose-blue); }
+    .entry.judge       { border-left-color: var(--judge); background: rgba(184,154,255,0.04); }
+    .entry.redacted    { opacity: 0.4; font-style: italic; }
+    .entry.injected    { border-left-color: var(--gold); background: rgba(201,168,76,0.04); }
+    .entry.objection   { border-left-color: #ff8c42; background: rgba(255,140,66,0.05); }
+
+    .entry-header {
+      display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
+    }
+    .entry-time { font-size: 0.68rem; color: var(--muted); margin-left: auto; }
+    .entry-content { font-size: 0.87rem; line-height: 1.65; }
+    .entry-citations { margin-top: 8px; }
+    .citation-chip {
+      display: inline-block;
+      font-size: 0.68rem; padding: 2px 8px; border-radius: 12px;
+      background: rgba(201,168,76,0.08); border: 1px solid var(--gold-dim);
+      color: var(--gold); margin-right: 4px; margin-top: 4px;
+    }
+    .entry-redacted-label { font-size: 0.75rem; color: var(--muted); font-style: italic; }
+
+    /* ── Empty state ──────────────────────────────────────────── */
+    #empty-state {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      height: 60%; gap: 12px; color: var(--muted);
+    }
+    #empty-state .gavel { font-size: 3rem; opacity: 0.3; }
+    #empty-state p { text-align: center; font-size: 0.85rem; }
+
+    /* ── Loading overlay ──────────────────────────────────────── */
+    .loading-bar {
+      position: fixed; top: 0; left: 0; right: 0; height: 2px;
+      background: linear-gradient(90deg, transparent, var(--gold), transparent);
+      background-size: 200% 100%;
+      animation: shimmer 1.2s infinite;
+      display: none; z-index: 999;
+    }
+    .loading-bar.active { display: block; }
+    @keyframes shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
+
+    /* ── Control Panel ────────────────────────────────────────── */
+    #panel-controls { background: var(--surface); }
+
+    .action-group { margin-bottom: 24px; }
+    .action-group h3 { font-size: 0.72rem; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 10px; }
+
+    .btn-row { display: flex; flex-direction: column; gap: 8px; }
+
+    .inject-box { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-top: 8px; }
+    .inject-box textarea { width: 100%; background: transparent; border: none; color: var(--text); font-family: 'Inter', sans-serif; font-size: 0.82rem; resize: none; outline: none; }
+    .redact-box { display: flex; gap: 6px; margin-top: 8px; }
+    .redact-box input { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 7px 10px; font-size: 0.82rem; }
+
+    /* ── Verdict panel ────────────────────────────────────────── */
+    .verdict-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+      margin-top: 8px;
+    }
+    .verdict-decision {
+      font-family: 'Cinzel', serif;
+      font-size: 1.4rem;
+      font-weight: 800;
+      letter-spacing: 2px;
+      text-align: center;
+      padding: 12px;
+      border-radius: 8px;
+      margin-bottom: 12px;
+    }
+    .verdict-GUILTY     { background: rgba(224,82,82,0.12); color: var(--prose-red); border: 1px solid rgba(224,82,82,0.3); }
+    .verdict-NOT-GUILTY { background: rgba(82,168,224,0.12); color: var(--prose-blue); border: 1px solid rgba(82,168,224,0.3); }
+    .verdict-MISTRIAL   { background: rgba(201,168,76,0.1); color: var(--gold); border: 1px solid var(--gold-dim); }
+
+    .verdict-reasoning { font-size: 0.8rem; color: var(--muted); line-height: 1.6; margin-bottom: 10px; }
+    .verdict-factors { list-style: none; }
+    .verdict-factors li { font-size: 0.78rem; padding: 4px 0; border-bottom: 1px solid var(--border); color: var(--text); }
+    .verdict-factors li::before { content: "▸ "; color: var(--gold); }
+
+    /* ── Scrollbars ───────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 10px; }
+
+    /* ── Toast ────────────────────────────────────────────────── */
+    #toast {
+      position: fixed; bottom: 24px; right: 24px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 10px 18px;
+      border-radius: 8px;
+      font-size: 0.82rem;
+      max-width: 300px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+      transform: translateY(80px);
+      opacity: 0;
+      transition: all 0.3s;
+      z-index: 1000;
+    }
+    #toast.show { transform: translateY(0); opacity: 1; }
+    #toast.error { border-color: rgba(224,82,82,0.4); color: var(--prose-red); }
+    #toast.success { border-color: rgba(82,168,224,0.3); color: var(--prose-blue); }
+
+    /* ── Responsive ───────────────────────────────────────────── */
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; grid-template-rows: auto 1fr auto; height: auto; }
+      .panel { border-right: none; border-bottom: 1px solid var(--border); }
+    }
+  </style>
+</head>
+<body>
+  <div class="loading-bar" id="loading-bar"></div>
+  <div id="toast"></div>
+
+  <div class="app">
+    <header>
+      <div class="logo">
+        SUPREME
+        <span>AI Courtroom Simulator</span>
+      </div>
+      <div id="status-pill" class="status-pill">IDLE</div>
+    </header>
+
+    <main>
+      <!-- ══ LEFT: Case Setup ══════════════════════════════════════ -->
+      <aside class="panel" id="panel-setup">
+        <h2>⚖ Case Setup</h2>
+
+        <div class="form-group">
+          <label>Case Title</label>
+          <input id="f-title" type="text" placeholder="State v. Defendant" value="State v. Rohan Mehta" />
+        </div>
+
+        <div class="form-group">
+          <label>Case Description</label>
+          <textarea id="f-desc" rows="3" placeholder="Brief facts of the case…">Defendant accused of financial fraud involving forged documents and embezzlement from a public trust fund.</textarea>
+        </div>
+
+        <div class="form-group">
+          <label>Charges (press Enter to add)</label>
+          <div class="tag-input-row">
+            <input id="f-charge-input" type="text" placeholder="e.g. Financial Fraud" />
+            <button class="btn btn-ghost btn-sm" onclick="addTag('charges')">+ Add</button>
+          </div>
+          <div class="tag-list" id="charges-tags"></div>
+        </div>
+
+        <div class="form-group">
+          <label>Evidence (press Enter to add)</label>
+          <div class="tag-input-row">
+            <input id="f-evidence-input" type="text" placeholder="e.g. Forged documents" />
+            <button class="btn btn-ghost btn-sm" onclick="addTag('evidence')">+ Add</button>
+          </div>
+          <div class="tag-list" id="evidence-tags"></div>
+        </div>
+
+        <div class="form-group">
+          <label>Difficulty</label>
+          <select id="f-difficulty">
+            <option value="easy">Easy (1 turn / stage)</option>
+            <option value="medium" selected>Medium (2 turns / stage)</option>
+            <option value="hard">Hard (3 turns / stage)</option>
+          </select>
+        </div>
+
+        <button class="btn btn-primary" id="btn-create" onclick="createCase()">
+          🔨 Convene Trial
+        </button>
+
+        <div id="session-info" style="margin-top:14px; display:none;">
+          <div style="font-size:0.72rem; color:var(--muted);">SESSION ID</div>
+          <div id="session-id-display" style="font-size:0.8rem; color:var(--gold); word-break:break-all; margin-top:3px;"></div>
+        </div>
+      </aside>
+
+      <!-- ══ CENTRE: Transcript ════════════════════════════════════ -->
+      <section class="panel" id="panel-transcript">
+        <h2>📜 Trial Transcript</h2>
+
+        <div class="stage-indicator" id="stage-indicator">
+          <div class="stage-dot" style="background:var(--muted);box-shadow:none;animation:none;"></div>
+          <span class="stage-text" id="stage-text">Awaiting trial start…</span>
+        </div>
+
+        <div id="transcript-list">
+          <div id="empty-state">
+            <div class="gavel">⚖️</div>
+            <p>Set up a case on the left and click<br><strong>Convene Trial</strong> to begin.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══ RIGHT: Controls ═══════════════════════════════════════ -->
+      <aside class="panel" id="panel-controls">
+        <h2>🎮 Control Panel</h2>
+
+        <!-- Turn controls -->
+        <div class="action-group">
+          <h3>Trial Controls</h3>
+          <div class="btn-row">
+            <button class="btn btn-primary" id="btn-next" onclick="nextTurn()" disabled>
+              ▶ Next Turn
+            </button>
+            <button class="btn btn-ghost" id="btn-ff" onclick="fastForward()" disabled>
+              ⏩ Fast Forward to Verdict
+            </button>
+            <button class="btn btn-ghost" id="btn-verdict" onclick="forceVerdict()" disabled>
+              ⚖ Force Verdict
+            </button>
+            <button class="btn btn-ghost" id="btn-reset" onclick="resetTrial()" disabled>
+              🔄 Reset Trial
+            </button>
+          </div>
+        </div>
+
+        <!-- Objection -->
+        <div class="action-group">
+          <h3>Objection</h3>
+          <button class="btn btn-danger" id="btn-objection" onclick="raiseObjection()" disabled>
+            🚨 Raise Objection
+          </button>
+        </div>
+
+        <!-- Inject testimony -->
+        <div class="action-group">
+          <h3>Inject Testimony</h3>
+          <div class="inject-box">
+            <textarea id="inject-text" rows="3" placeholder="Type witness testimony to inject…"></textarea>
+          </div>
+          <button class="btn btn-info btn-sm" style="margin-top:6px;width:100%;" id="btn-inject" onclick="injectTestimony()" disabled>
+            💉 Inject Testimony
+          </button>
+        </div>
+
+        <!-- Redact -->
+        <div class="action-group">
+          <h3>Redact Entry</h3>
+          <div class="redact-box">
+            <input id="redact-text" type="text" placeholder="Keyword to redact…" />
+            <button class="btn btn-danger btn-sm" id="btn-redact" onclick="redactEntry()" disabled>Redact</button>
+          </div>
+        </div>
+
+        <!-- Verdict display -->
+        <div class="action-group" id="verdict-display" style="display:none;">
+          <h3>Verdict</h3>
+          <div class="verdict-panel" id="verdict-content"></div>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <script>
+    /* ── State ────────────────────────────────────────────────── */
+    const BASE = '';  // same origin
+    let sessionId   = null;
+    let isComplete  = false;
+    let isLoading   = false;
+
+    const tagData = { charges: [], evidence: [] };
+
+    /* ── Tag management ────────────────────────────────────────── */
+    function addTag(type) {
+      const inputId = type === 'charges' ? 'f-charge-input' : 'f-evidence-input';
+      const input   = document.getElementById(inputId);
+      const val     = input.value.trim();
+      if (!val) return;
+      tagData[type].push(val);
+      input.value = '';
+      renderTags(type);
+    }
+
+    function removeTag(type, idx) {
+      tagData[type].splice(idx, 1);
+      renderTags(type);
+    }
+
+    function renderTags(type) {
+      const el = document.getElementById(`${type}-tags`);
+      el.innerHTML = tagData[type].map((t, i) =>
+        `<span class="tag">${escHtml(t)}<span class="rm" onclick="removeTag('${type}',${i})">✕</span></span>`
+      ).join('');
+    }
+
+    // Pre-populate demo tags
+    ['Financial Fraud', 'Embezzlement', 'Forgery'].forEach(c => { tagData.charges.push(c); });
+    ['Forged transaction ledgers', 'Bank statements showing transfers', 'Whistleblower testimony'].forEach(e => { tagData.evidence.push(e); });
+    renderTags('charges');
+    renderTags('evidence');
+
+    // Allow Enter key to add tags
+    document.getElementById('f-charge-input').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addTag('charges'); } });
+    document.getElementById('f-evidence-input').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addTag('evidence'); } });
+
+    /* ── API helpers ───────────────────────────────────────────── */
+    function setLoading(on) {
+      isLoading = on;
+      document.getElementById('loading-bar').classList.toggle('active', on);
+    }
+
+    async function api(method, path, body = null) {
+      setLoading(true);
+      try {
+        const opts = {
+          method,
+          headers: { 'Content-Type': 'application/json' },
+        };
+        if (body) opts.body = JSON.stringify(body);
+        const res = await fetch(`${BASE}${path}`, opts);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+        return data;
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    /* ── Toast ─────────────────────────────────────────────────── */
+    let _toastTimer;
+    function toast(msg, type = '') {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.className = `show ${type}`;
+      clearTimeout(_toastTimer);
+      _toastTimer = setTimeout(() => el.className = '', 3000);
+    }
+
+    /* ── Escape HTML ───────────────────────────────────────────── */
+    function escHtml(str) {
+      return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    /* ── UI helpers ────────────────────────────────────────────── */
+    function setStatus(text) {
+      document.getElementById('status-pill').textContent = text;
+    }
+
+    function enableControls(on) {
+      ['btn-next','btn-ff','btn-verdict','btn-reset','btn-objection','btn-inject','btn-redact'].forEach(id => {
+        document.getElementById(id).disabled = !on;
+      });
+    }
+
+    function setStage(stage, agent) {
+      const dot  = document.querySelector('.stage-dot');
+      const text = document.getElementById('stage-text');
+      const colours = { prosecution:'var(--prose-red)', defense:'var(--prose-blue)', judge:'var(--judge)' };
+      const col = colours[agent] || 'var(--gold)';
+      dot.style.background = col;
+      dot.style.boxShadow  = `0 0 8px ${col}`;
+      text.innerHTML = `<strong>${stage}</strong>  <span class="agent-badge agent-${agent}">${agent}</span>`;
+    }
+
+    /* ── Build transcript entry HTML ───────────────────────────── */
+    function entryClass(agent, content) {
+      if (content.startsWith('OBJECTION:')) return 'objection';
+      if (content.startsWith('[WITNESS')) return 'injected';
+      return agent;
+    }
+
+    function renderEntry(entry) {
+      const cls  = entryClass(entry.agent, entry.content);
+      const time = new Date(entry.timestamp).toLocaleTimeString();
+      const citationsHtml = (entry.citations || []).map(c =>
+        `<span class="citation-chip" title="${escHtml(c.summary)}">${escHtml(c.case_id)} (${c.relevance_score})</span>`
+      ).join('');
+
+      const content = entry.redacted
+        ? `<span class="entry-redacted-label">⛔ [REDACTED]</span>`
+        : escHtml(entry.content);
+
+      return `
+        <div class="entry ${cls} ${entry.redacted ? 'redacted' : ''}">
+          <div class="entry-header">
+            <span class="agent-badge agent-${entry.agent}">${entry.agent}</span>
+            <span style="font-size:0.72rem;color:var(--muted);">${escHtml(entry.stage)}</span>
+            <span class="entry-time">${time}</span>
+          </div>
+          <div class="entry-content">${content}</div>
+          ${citationsHtml ? `<div class="entry-citations">${citationsHtml}</div>` : ''}
+        </div>`;
+    }
+
+    function appendEntry(entry) {
+      const list = document.getElementById('transcript-list');
+      const empty = document.getElementById('empty-state');
+      if (empty) empty.remove();
+      list.insertAdjacentHTML('beforeend', renderEntry(entry));
+      list.lastElementChild.scrollIntoView({ behavior: 'smooth' });
+    }
+
+    function rebuildTranscript(transcript) {
+      const list = document.getElementById('transcript-list');
+      list.innerHTML = '';
+      if (!transcript || transcript.length === 0) {
+        list.innerHTML = `<div id="empty-state"><div class="gavel">⚖️</div><p>No proceedings yet.</p></div>`;
+        return;
+      }
+      transcript.forEach(e => list.insertAdjacentHTML('beforeend', renderEntry(e)));
+    }
+
+    function showVerdict(verdict) {
+      const display = document.getElementById('verdict-display');
+      const content = document.getElementById('verdict-content');
+      display.style.display = 'block';
+
+      const safe    = verdict.decision.replace(/\s+/g, '-');
+      const factors = (verdict.key_factors || []).map(f => `<li>${escHtml(f)}</li>`).join('');
+
+      content.innerHTML = `
+        <div class="verdict-decision verdict-${safe}">${escHtml(verdict.decision)}</div>
+        <div class="verdict-reasoning">${escHtml(verdict.reasoning)}</div>
+        ${factors ? `<ul class="verdict-factors">${factors}</ul>` : ''}
+        <div style="text-align:right;font-size:0.72rem;color:var(--muted);margin-top:8px;">
+          Confidence: ${Math.round((verdict.confidence || 0) * 100)}%
+        </div>`;
+    }
+
+    /* ── Actions ────────────────────────────────────────────────── */
+    async function createCase() {
+      const title  = document.getElementById('f-title').value.trim();
+      const desc   = document.getElementById('f-desc').value.trim();
+      const diff   = document.getElementById('f-difficulty').value;
+
+      if (!title) { toast('Please enter a case title.', 'error'); return; }
+      if (tagData.charges.length === 0) { toast('Add at least one charge.', 'error'); return; }
+      if (tagData.evidence.length === 0) { toast('Add at least one piece of evidence.', 'error'); return; }
+
+      try {
+        document.getElementById('btn-create').disabled = true;
+        const data = await api('POST', '/api/case', {
+          title, description: desc,
+          charges: tagData.charges,
+          evidence: tagData.evidence,
+          difficulty: diff,
+        });
+        sessionId = data.session_id;
+        document.getElementById('session-info').style.display = 'block';
+        document.getElementById('session-id-display').textContent = sessionId;
+        enableControls(true);
+        setStatus('IN SESSION');
+        setStage('OPENING_PROS', 'prosecution');
+        document.getElementById('transcript-list').innerHTML = '';
+        document.getElementById('verdict-display').style.display = 'none';
+        isComplete = false;
+        toast(`Trial "${title}" convened.`, 'success');
+      } catch (e) {
+        toast(e.message, 'error');
+        document.getElementById('btn-create').disabled = false;
+      }
+    }
+
+    async function nextTurn() {
+      if (!sessionId || isComplete) return;
+      try {
+        const data = await api('POST', `/api/session/${sessionId}/next`);
+        appendEntry(data.entry);
+        setStage(data.stage, data.active_agent);
+        if (data.is_complete) {
+          isComplete = true;
+          setStatus('VERDICT DELIVERED');
+          document.getElementById('btn-next').disabled = true;
+          // Load full state to get verdict
+          const state = await api('GET', `/api/session/${sessionId}`);
+          if (state.verdict) showVerdict(state.verdict);
+          toast('Trial complete. Verdict delivered.', 'success');
+        }
+      } catch (e) { toast(e.message, 'error'); }
+    }
+
+    async function forceVerdict() {
+      if (!sessionId) return;
+      try {
+        const data = await api('POST', `/api/session/${sessionId}/verdict`);
+        showVerdict(data.verdict);
+        isComplete = true;
+        setStatus('VERDICT DELIVERED');
+        document.getElementById('btn-next').disabled = true;
+        const state = await api('GET', `/api/session/${sessionId}`);
+        rebuildTranscript(state.transcript);
+        toast('Verdict delivered.', 'success');
+      } catch (e) { toast(e.message, 'error'); }
+    }
+
+    async function fastForward() {
+      if (!sessionId) return;
+      try {
+        const data = await api('POST', `/api/session/${sessionId}/fast-forward`);
+        showVerdict(data.verdict);
+        isComplete = true;
+        setStatus('VERDICT DELIVERED');
+        document.getElementById('btn-next').disabled = true;
+        const state = await api('GET', `/api/session/${sessionId}`);
+        rebuildTranscript(state.transcript);
+        toast('Fast-forwarded to verdict.', 'success');
+      } catch (e) { toast(e.message, 'error'); }
+    }
+
+    async function resetTrial() {
+      if (!sessionId) return;
+      try {
+        await api('POST', `/api/session/${sessionId}/reset`);
+        isComplete = false;
+        document.getElementById('btn-next').disabled = false;
+        document.getElementById('transcript-list').innerHTML = '';
+        document.getElementById('verdict-display').style.display = 'none';
+        setStage('OPENING_PROS', 'prosecution');
+        setStatus('IN SESSION');
+        toast('Trial reset.', 'success');
+      } catch (e) { toast(e.message, 'error'); }
+    }
+
+    async function raiseObjection() {
+      if (!sessionId) return;
+      try {
+        const data = await api('POST', `/api/session/${sessionId}/control`, {
+          action: 'objection', payload: 'Counsel\'s statement is improper and prejudicial.'
+        });
+        const entries = data.state.transcript;
+        if (entries.length) appendEntry(entries[entries.length - 1]);
+        toast('Objection raised!', 'success');
+      } catch (e) { toast(e.message, 'error'); }
+    }
+
+    async function injectTestimony() {
+      if (!sessionId) return;
+      const text = document.getElementById('inject-text').value.trim();
+      if (!text) { toast('Enter testimony text first.', 'error'); return; }
+      try {
+        const data = await api('POST', `/api/session/${sessionId}/control`, {
+          action: 'inject_testimony', payload: text
+        });
+        const entries = data.state.transcript;
+        if (entries.length) appendEntry(entries[entries.length - 1]);
+        document.getElementById('inject-text').value = '';
+        toast('Testimony injected.', 'success');
+      } catch (e) { toast(e.message, 'error'); }
+    }
+
+    async function redactEntry() {
+      if (!sessionId) return;
+      const keyword = document.getElementById('redact-text').value.trim();
+      if (!keyword) { toast('Enter a keyword to redact.', 'error'); return; }
+      try {
+        await api('POST', `/api/session/${sessionId}/control`, {
+          action: 'redact', payload: keyword
+        });
+        document.getElementById('redact-text').value = '';
+        // Rebuild from server state to show redactions
+        const state = await api('GET', `/api/session/${sessionId}`);
+        rebuildTranscript(state.transcript);
+        toast(`Entries containing "${keyword}" redacted.`, 'success');
+      } catch (e) { toast(e.message, 'error'); }
+    }
+  </script>
+</body>
+</html>
