@@ -12,6 +12,7 @@ from app.models.trial import (
     CreateCaseRequest,
 )
 from app.services import trial_service
+from app.tools.rag import rag_diagnostics
 
 router = APIRouter()
 
@@ -21,6 +22,12 @@ router = APIRouter()
 @router.get("/health", tags=["meta"])
 async def health():
     return {"status": "ok"}
+
+
+@router.get("/api/debug/rag", tags=["debug"])
+async def debug_rag():
+    """Inspect current RAG + Qdrant runtime health."""
+    return rag_diagnostics()
 
 
 # ── Case / Session ─────────────────────────────────────────────────────────────

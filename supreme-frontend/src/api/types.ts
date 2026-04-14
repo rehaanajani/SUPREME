@@ -1,4 +1,4 @@
-// src/types.ts — mirrors backend Pydantic models
+export type Difficulty = 'easy' | 'medium' | 'hard';
 
 export type AgentRole = 'prosecution' | 'defense' | 'judge';
 
@@ -12,12 +12,28 @@ export type TrialStage =
   | 'VERDICT'
   | 'COMPLETE';
 
-export type Difficulty = 'easy' | 'medium' | 'hard';
+export type ControlAction = 'objection' | 'redact' | 'inject_testimony';
 
 export interface Citation {
   case_id: string;
   summary: string;
   relevance_score: number;
+}
+
+export interface ToolCallTrace {
+  name: string;
+  status: string;
+  input: Record<string, unknown>;
+  output: Record<string, unknown>;
+  error?: string | null;
+}
+
+export interface AgentDebugTrace {
+  runner: string;
+  system_prompt: string;
+  user_prompt: string;
+  tool_calls: ToolCallTrace[];
+  final_output: string;
 }
 
 export interface TranscriptEntry {
@@ -28,13 +44,7 @@ export interface TranscriptEntry {
   timestamp: string;
   citations: Citation[];
   redacted: boolean;
-}
-
-export interface Verdict {
-  decision: 'GUILTY' | 'NOT GUILTY' | 'MISTRIAL';
-  reasoning: string;
-  key_factors: string[];
-  confidence: number;
+  debug?: AgentDebugTrace | null;
 }
 
 export interface CaseDetails {
@@ -46,6 +56,13 @@ export interface CaseDetails {
   difficulty: Difficulty;
 }
 
+export interface Verdict {
+  decision: string;
+  reasoning: string;
+  key_factors: string[];
+  confidence: number;
+}
+
 export interface TrialState {
   session_id: string;
   case: CaseDetails;
@@ -55,16 +72,16 @@ export interface TrialState {
   verdict: Verdict | null;
   stage_turn: number;
   turns_per_stage: number;
+  created_at: string;
+  updated_at: string;
 }
-
-// ── API Request / Response ──────────────────────────────────────────────────
 
 export interface CreateCaseRequest {
   title: string;
   description: string;
   charges: string[];
   evidence: string[];
-  difficulty: Difficulty;
+  difficulty?: Difficulty;
 }
 
 export interface CreateCaseResponse {
@@ -81,15 +98,20 @@ export interface NextTurnResponse {
   is_complete: boolean;
 }
 
-export interface VerdictResponse {
-  session_id: string;
-  verdict: Verdict;
-  transcript_length: number;
+export interface ControlRequest {
+  action: ControlAction;
+  payload?: string;
 }
 
 export interface ControlResponse {
   session_id: string;
-  action: string;
+  action: ControlAction;
   result: string;
   state: TrialState;
+}
+
+export interface VerdictResponse {
+  session_id: string;
+  verdict: Verdict;
+  transcript_length: number;
 }

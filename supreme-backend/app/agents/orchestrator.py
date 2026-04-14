@@ -142,7 +142,7 @@ async def run_next_turn(state: TrialState) -> tuple[TrialState, TranscriptEntry 
 
 async def run_verdict(state: TrialState) -> tuple[TrialState, TranscriptEntry]:
     """Force the judge to deliver a verdict over the current transcript."""
-    raw = await run_judge(state.case, state.transcript)
+    raw, debug = await run_judge(state.case, state.transcript)
     verdict = _parse_verdict(raw)
     state.verdict = verdict
     state.stage = TrialStage.COMPLETE
@@ -154,6 +154,7 @@ async def run_verdict(state: TrialState) -> tuple[TrialState, TranscriptEntry]:
         stage=TrialStage.VERDICT,
         content=raw,
         timestamp=datetime.utcnow(),
+        debug=debug,
     )
     state.transcript.append(entry)
     return state, entry
