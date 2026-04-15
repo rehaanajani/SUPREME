@@ -82,6 +82,10 @@ class CaseDetails(BaseModel):
 class ObjectionRuling(BaseModel):
     ruling: str                      # "SUSTAINED" | "OVERRULED"
     reason: str                      # LLM-generated reasoning
+    analysis: Optional[str] = None   # fuller legal analysis by LLM
+    challenged_entry_id: Optional[str] = None
+    challenged_agent: Optional[AgentRole] = None
+    effect: Optional[str] = None
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 

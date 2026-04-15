@@ -6,7 +6,6 @@ import {
   FileText,
   Mic,
   StepBack,
-  Pause,
   StepForward,
   Eraser,
   Upload,
@@ -26,7 +25,6 @@ import { ApiError } from './api/client';
 import {
   control,
   createCase,
-  fastForward,
   getSession,
   listSessions,
   nextTurn,
@@ -35,6 +33,7 @@ import {
 import type {
   AgentRole as BackendAgentRole,
   CreateCaseRequest,
+  ObjectionRuling as BackendObjectionRuling,
   TrialStage as BackendTrialStage,
   TrialState as BackendTrialState,
   TranscriptEntry as BackendTranscriptEntry,
@@ -106,10 +105,10 @@ type VoiceRole = Extract<BackendAgentRole, 'prosecution' | 'defense' | 'judge'>;
 
 type VoiceCommand =
   | { type: 'next'; label: string }
-  | { type: 'verdict'; label: string }
   | { type: 'reset'; label: string }
   | { type: 'open'; label: string; target: View }
   | { type: 'objection'; label: string; payload: string }
+  | { type: 'objection_requires_reason'; label: string }
   | { type: 'redact'; label: string; payload: string }
   | { type: 'inject'; label: string; payload: string };
 
@@ -122,9 +121,13 @@ export function unblockSpeech() { speechBlocked = false; }
 export function isSpeechBlocked() { return speechBlocked; }
 
 function getVapiVoiceId(role: VoiceRole): string {
-  if (role === 'prosecution') return VAPI_PROSECUTOR_VOICE;
-  if (role === 'defense') return VAPI_DEFENSE_VOICE;
-  return VAPI_JUDGE_VOICE;
+  if (role === 'prosecution') {
+    return VAPI_PROSECUTOR_VOICE || VAPI_JUDGE_VOICE || VAPI_DEFENSE_VOICE;
+  }
+  if (role === 'defense') {
+    return VAPI_DEFENSE_VOICE || VAPI_JUDGE_VOICE || VAPI_PROSECUTOR_VOICE;
+  }
+  return VAPI_JUDGE_VOICE || VAPI_PROSECUTOR_VOICE || VAPI_DEFENSE_VOICE;
 }
 
 function hasVapiVoice(role: VoiceRole): boolean {
@@ -172,6 +175,41 @@ function cleanVoiceCommandPayload(payload: string, fallback: string): string {
   return cleaned || fallback;
 }
 
+function normaliseObjectionReason(payload: string): string {
+  return payload
+    .replace(/^noted\s*[:,-]?\s*/i, '')
+    .replace(/^that\s+/i, '')
+    .replace(/^is\s+/i, '')
+    .replace(/^because\s+/i, '')
+    .trim();
+}
+
+function voiceCommandFingerprint(command: VoiceCommand): string {
+  if (command.type === 'open') return `${command.type}:${command.target}`;
+  if (command.type === 'objection' || command.type === 'redact' || command.type === 'inject') {
+    return `${command.type}:${command.payload.toLowerCase()}`;
+  }
+  return command.type;
+}
+
+function isVoiceCommandConfirmation(text: string): boolean {
+  const lower = text.trim().toLowerCase();
+  return lower.startsWith('next turn')
+    || lower.startsWith('objection noted')
+    || lower.startsWith('state objection reason')
+    || lower.startsWith('resetting trial')
+    || lower.startsWith('opening evidence')
+    || lower.startsWith('opening transcript')
+    || lower.startsWith('redacting:')
+    || lower.startsWith('injecting testimony:')
+    || lower.startsWith('command not recognized');
+}
+
+function isProceduralTranscriptEntry(entry: BackendTranscriptEntry): boolean {
+  const upper = entry.content.trim().toUpperCase();
+  return upper.startsWith('OBJECTION:') || upper.startsWith('RULING:');
+}
+
 function parseVoiceCommand(input: string): VoiceCommand | null {
   const text = input.trim();
   if (!text) return null;
@@ -179,10 +217,6 @@ function parseVoiceCommand(input: string): VoiceCommand | null {
 
   if (/\b(next|proceed|continue|next turn)\b/.test(lower)) {
     return { type: 'next', label: 'NEXT TURN' };
-  }
-
-  if (/\b(fast\s*forward|give\s+verdict|show\s+verdict|final\s+verdict|verdict\s+now)\b/.test(lower)) {
-    return { type: 'verdict', label: 'FAST FORWARD TO VERDICT' };
   }
 
   if (/\b(reset|restart\s+trial|new\s+trial)\b/.test(lower)) {
@@ -203,10 +237,17 @@ function parseVoiceCommand(input: string): VoiceCommand | null {
 
   const objectionMatch = text.match(/\bobjection\b\s*[:,-]?\s*(.*)$/i);
   if (objectionMatch) {
+    const reason = normaliseObjectionReason(cleanVoiceCommandPayload(objectionMatch[1] || '', ''));
+    if (!reason) {
+      return {
+        type: 'objection_requires_reason',
+        label: 'OBJECTION REASON REQUIRED',
+      };
+    }
     return {
       type: 'objection',
       label: 'OBJECTION',
-      payload: cleanVoiceCommandPayload(objectionMatch[1] || '', 'Objection, Your Honour.'),
+      payload: reason,
     };
   }
 
@@ -660,12 +701,14 @@ export default function App() {
   const [voiceCommandStatus, setVoiceCommandStatus] = useState<VoiceModeStatus>('idle');
   const [voiceCommandMessage, setVoiceCommandMessage] = useState('Voice mode offline.');
   const [isVoiceControlEnabled, setIsVoiceControlEnabled] = useState(false);
+  const [isTestingVoice, setIsTestingVoice] = useState(false);
   const [lastVoiceCommand, setLastVoiceCommand] = useState<string>('None');
   const voiceControlRunningRef = useRef(false);
   const voiceControlTokenRef = useRef(0);
   const latestSessionIdRef = useRef<string | null>(null);
   const viewRef = useRef<View>('landing');
   const actionLockRef = useRef(false);
+  const recentVoiceCommandsRef = useRef<Map<string, number>>(new Map());
   const voiceLifecycleRef = useRef<{
     stop: () => Promise<void>;
     active: () => boolean;
@@ -684,7 +727,30 @@ export default function App() {
   const [objectionText, setObjectionText] = useState('');
   const [judgeRuling, setJudgeRuling] = useState<null | 'SUSTAINED' | 'OVERRULED'>(null);
   const [judgeRulingReason, setJudgeRulingReason] = useState<string>('');
+  const [judgeRulingAnalysis, setJudgeRulingAnalysis] = useState<string>('');
+  const [judgeRulingEffect, setJudgeRulingEffect] = useState<string>('');
   const [judgeStatus, setJudgeStatus] = useState<'LISTENING' | 'EVALUATING' | 'RULING' | 'HALTED'>('LISTENING');
+
+  const clearJudgeRuling = useCallback(() => {
+    setJudgeRuling(null);
+    setJudgeRulingReason('');
+    setJudgeRulingAnalysis('');
+    setJudgeRulingEffect('');
+  }, []);
+
+  const applyJudgeRuling = useCallback((ruling?: BackendObjectionRuling | null) => {
+    if (ruling) {
+      setJudgeRuling(ruling.ruling);
+      setJudgeRulingReason(ruling.reason || 'The court has issued a ruling.');
+      setJudgeRulingAnalysis(ruling.analysis || '');
+      setJudgeRulingEffect(ruling.effect || '');
+      return;
+    }
+    setJudgeRuling('OVERRULED');
+    setJudgeRulingReason('The court was unable to adjudicate at this time.');
+    setJudgeRulingAnalysis('');
+    setJudgeRulingEffect('');
+  }, []);
 
   const evidenceRecords = useMemo(() => buildEvidenceFromState(trialState), [trialState]);
   const transcriptEntries = useMemo(
@@ -739,19 +805,18 @@ export default function App() {
       await syncSession(created.session_id);
       setView('simulation');
       setJudgeStatus('LISTENING');
-      setJudgeRuling(null);
+      clearJudgeRuling();
     });
-  }, [syncSession, withSessionAction]);
+  }, [clearJudgeRuling, syncSession, withSessionAction]);
 
   const handleResumeSession = useCallback(async (sid: string) => {
     await withSessionAction(async () => {
       await syncSession(sid);
       setView('simulation');
       setJudgeStatus('LISTENING');
-      setJudgeRuling(null);
-      setJudgeRulingReason('');
+      clearJudgeRuling();
     });
-  }, [syncSession, withSessionAction]);
+  }, [clearJudgeRuling, syncSession, withSessionAction]);
 
   const handleObjection = () => {
     if (!sessionId || isLoading || actionLockRef.current) return;
@@ -774,14 +839,7 @@ export default function App() {
     withSessionAction(async () => {
       const response = await control(sessionId, { action: 'objection', payload });
       await syncSession(sessionId);
-      const ruling = response.objection_ruling;
-      if (ruling) {
-        setJudgeRuling(ruling.ruling as 'SUSTAINED' | 'OVERRULED');
-        setJudgeRulingReason(ruling.reason);
-      } else {
-        setJudgeRuling('OVERRULED');
-        setJudgeRulingReason('The court was unable to adjudicate at this time.');
-      }
+      applyJudgeRuling(response.objection_ruling);
       setJudgeStatus('RULING');
     });
   };
@@ -845,32 +903,15 @@ export default function App() {
     });
   }, [syncSession, withSessionAction]);
 
-  const handleFastForward = useCallback(() => {
-    if (!sessionId || isLoading) return;
-    withSessionAction(async () => {
-      await fastForward(sessionId);
-      await syncSession(sessionId);
-    });
-  }, [isLoading, sessionId, syncSession, withSessionAction]);
-
-  const triggerFastForward = useCallback(() => {
-    const sid = latestSessionIdRef.current;
-    if (!sid) return;
-    withSessionAction(async () => {
-      await fastForward(sid);
-      await syncSession(sid);
-    });
-  }, [syncSession, withSessionAction]);
-
   const handleReset = useCallback(() => {
     if (!sessionId || isLoading) return;
     withSessionAction(async () => {
       await resetTrial(sessionId);
       await syncSession(sessionId);
       setJudgeStatus('LISTENING');
-      setJudgeRuling(null);
+      clearJudgeRuling();
     });
-  }, [isLoading, sessionId, syncSession, withSessionAction]);
+  }, [clearJudgeRuling, isLoading, sessionId, syncSession, withSessionAction]);
 
   const triggerReset = useCallback(() => {
     const sid = latestSessionIdRef.current;
@@ -879,9 +920,9 @@ export default function App() {
       await resetTrial(sid);
       await syncSession(sid);
       setJudgeStatus('LISTENING');
-      setJudgeRuling(null);
+      clearJudgeRuling();
     });
-  }, [syncSession, withSessionAction]);
+  }, [clearJudgeRuling, syncSession, withSessionAction]);
 
   const runVoiceCommand = useCallback((command: VoiceCommand) => {
     const sid = latestSessionIdRef.current;
@@ -896,10 +937,6 @@ export default function App() {
       triggerNextTurn();
       return;
     }
-    if (command.type === 'verdict') {
-      triggerFastForward();
-      return;
-    }
     if (command.type === 'reset') {
       triggerReset();
       return;
@@ -907,6 +944,12 @@ export default function App() {
     if (command.type === 'open') {
       setView(command.target);
       setVoiceCommandMessage(`Navigated to ${command.target.toUpperCase()}.`);
+      return;
+    }
+    if (command.type === 'objection_requires_reason') {
+      setVoiceCommandMessage('Objection needs a reason. Say: objection, hearsay.');
+      setJudgeStatus('HALTED');
+      setIsObjecting(true);
       return;
     }
     if (command.type === 'redact') {
@@ -922,18 +965,11 @@ export default function App() {
       withSessionAction(async () => {
         const response = await control(sid, { action: 'objection', payload: command.payload });
         await syncSession(sid);
-        const ruling = response.objection_ruling;
-        if (ruling) {
-          setJudgeRuling(ruling.ruling as 'SUSTAINED' | 'OVERRULED');
-          setJudgeRulingReason(ruling.reason);
-        } else {
-          setJudgeRuling('OVERRULED');
-          setJudgeRulingReason('The court was unable to adjudicate at this time.');
-        }
+        applyJudgeRuling(response.objection_ruling);
         setJudgeStatus('RULING');
       });
     }
-  }, [handleInjectTestimonyText, handleRedactText, syncSession, triggerFastForward, triggerNextTurn, triggerReset, withSessionAction]);
+  }, [applyJudgeRuling, handleInjectTestimonyText, handleRedactText, syncSession, triggerNextTurn, triggerReset, withSessionAction]);
 
   const stopVoiceControl = useCallback(async () => {
     voiceControlTokenRef.current += 1;
@@ -971,13 +1007,12 @@ export default function App() {
     if (startToken !== voiceControlTokenRef.current) {
       return;
     }
-    const processed = new Set<string>();
     let active = true;
 
     const onCallStart = () => {
       if (!active) return;
       setVoiceCommandStatus('listening');
-      setVoiceCommandMessage('Listening for commands: next, objection, redact, verdict, transcript, evidence.');
+      setVoiceCommandMessage('Listening for commands: next, objection + reason, reset, redact, transcript, evidence.');
     };
 
     const onSpeechStart = () => {
@@ -1004,11 +1039,19 @@ export default function App() {
       if (!active) return;
       const chunks = extractVoiceTexts(message);
       for (const chunk of chunks) {
-        const key = chunk.toLowerCase();
-        if (processed.has(key)) continue;
-        processed.add(key);
+        if (isVoiceCommandConfirmation(chunk)) continue;
         const command = parseVoiceCommand(chunk);
         if (!command) continue;
+        const now = Date.now();
+        const fingerprint = voiceCommandFingerprint(command);
+        const lastSeen = recentVoiceCommandsRef.current.get(fingerprint) || 0;
+        if (now - lastSeen < 1500) continue;
+        recentVoiceCommandsRef.current.set(fingerprint, now);
+        for (const [key, ts] of recentVoiceCommandsRef.current) {
+          if (now - ts > 12_000) {
+            recentVoiceCommandsRef.current.delete(key);
+          }
+        }
         setVoiceCommandMessage(`Voice command: ${command.label}`);
         runVoiceCommand(command);
       }
@@ -1034,8 +1077,7 @@ export default function App() {
                 'COMMANDS YOU MUST RECOGNIZE:',
                 '- "next" / "proceed" / "continue" / "next turn" → respond: "Next turn."',
                 '- "objection" followed by a reason → respond: "Objection noted: [their reason]." IMPORTANT: include the FULL reason they gave.',
-                '- "objection" alone → respond: "Objection noted."',
-                '- "fast forward" / "verdict" / "give verdict" → respond: "Fast forwarding to verdict."',
+                '- "objection" alone → respond: "State objection reason."',
                 '- "reset" / "restart" / "new trial" → respond: "Resetting trial."',
                 '- "open evidence" → respond: "Opening evidence."',
                 '- "open transcript" → respond: "Opening transcript."',
@@ -1045,8 +1087,8 @@ export default function App() {
                 'RULES:',
                 '1. ALWAYS respond with the confirmation phrase listed above. This is your verbal feedback.',
                 '2. Keep ALL responses under 10 words.',
-                '3. If the user says something that is NOT a command, say: "Command not recognized. Try: next, objection, or verdict."',
-                '4. For objections, ALWAYS include the reason the user stated. Example: User says "objection, that is hearsay" → respond "Objection noted: that is hearsay."',
+                '3. If the user says something that is NOT a command, say: "Command not recognized. Try: next, objection, reset, redact, transcript, evidence."',
+                '4. For objections, ALWAYS include the reason the user stated. If no reason is provided, respond only: "State objection reason."',
                 '5. Do NOT have a conversation. Do NOT ask follow-up questions. Just confirm and wait.',
               ].join('\n'),
             },
@@ -1118,6 +1160,81 @@ export default function App() {
     void startVoiceControl();
   }, [isVoiceControlEnabled, startVoiceControl, stopVoiceControl, voiceCommandStatus]);
 
+  const testVoice = useCallback(async () => {
+    if (isTestingVoice) return;
+
+    setIsTestingVoice(true);
+    const shouldResumeVoiceControl = isVoiceControlEnabled;
+    const sample = 'Voice test complete. Courtroom audio channel is active.';
+
+    const runBrowserVoiceTest = async () => {
+      if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+        throw new Error('Browser speech synthesis is unavailable.');
+      }
+
+      const synth = window.speechSynthesis;
+      await new Promise<void>((resolve, reject) => {
+        const utterance = new SpeechSynthesisUtterance(sample);
+        utterance.rate = 0.96;
+        utterance.pitch = 0.92;
+        utterance.volume = 1;
+
+        const selectedVoice = pickJudgeVoice(synth.getVoices());
+        if (selectedVoice) utterance.voice = selectedVoice;
+
+        const timeoutId = window.setTimeout(() => {
+          synth.cancel();
+          reject(new Error('Browser speech synthesis timed out.'));
+        }, 8_000);
+
+        utterance.onend = () => {
+          window.clearTimeout(timeoutId);
+          resolve();
+        };
+
+        utterance.onerror = (event) => {
+          window.clearTimeout(timeoutId);
+          reject(new Error(`Browser speech synthesis failed: ${event.error || 'unknown error'}.`));
+        };
+
+        unlockAudio();
+        synth.cancel();
+        synth.resume();
+        synth.speak(utterance);
+      });
+    };
+
+    try {
+      if (shouldResumeVoiceControl) {
+        setVoiceCommandMessage('Pausing voice commands for audio test...');
+        await stopVoiceControl();
+      }
+
+      setVoiceCommandStatus('processing');
+
+      if (VAPI_PUBLIC_KEY && hasVapiVoice('judge')) {
+        setVoiceCommandMessage('Testing Vapi narration voice...');
+        await speakWithVapi('judge', sample);
+        setVoiceCommandStatus('idle');
+        setVoiceCommandMessage('Voice test passed via Vapi.');
+      } else {
+        setVoiceCommandMessage('Testing browser narration voice...');
+        await runBrowserVoiceTest();
+        setVoiceCommandStatus('idle');
+        setVoiceCommandMessage('Voice test passed via browser TTS.');
+      }
+    } catch (error) {
+      setVoiceCommandStatus('error');
+      setVoiceCommandMessage(`Voice test failed: ${parseError(error)}`);
+    } finally {
+      setIsTestingVoice(false);
+      if (shouldResumeVoiceControl) {
+        setVoiceCommandMessage('Restarting voice command mode after test...');
+        void startVoiceControl();
+      }
+    }
+  }, [isTestingVoice, isVoiceControlEnabled, startVoiceControl, stopVoiceControl]);
+
   useEffect(() => {
     return () => {
       void stopVoiceControl();
@@ -1130,7 +1247,13 @@ export default function App() {
     }
   }, [isVoiceControlEnabled, stopVoiceControl, view]);
 
-  const resumeProceedings = () => { setJudgeRuling(null); setJudgeRulingReason(''); setJudgeStatus('LISTENING'); unblockSpeech(); };
+  const resumeProceedings = () => { clearJudgeRuling(); setJudgeStatus('LISTENING'); unblockSpeech(); };
+
+  useEffect(() => {
+    if (!isVoiceControlEnabled) {
+      recentVoiceCommandsRef.current.clear();
+    }
+  }, [isVoiceControlEnabled]);
 
   const phaseIndex = TRIAL_PHASES.indexOf(trialPhase);
   const goPrev = () => handleReset();
@@ -1197,17 +1320,20 @@ export default function App() {
               voiceCommandStatus={voiceCommandStatus}
               voiceCommandMessage={voiceCommandMessage}
               lastVoiceCommand={lastVoiceCommand}
+              isTestingVoice={isTestingVoice}
               onToggleVoiceControl={toggleVoiceControl}
+              onTestVoice={testVoice}
               onPauseVoiceControl={stopVoiceControl}
               onViewEvidence={() => setView('evidence')}
               onViewTranscript={() => setView('transcript')}
-              onFastForward={handleFastForward}
               isObjecting={isObjecting}
               setIsObjecting={setIsObjecting}
               objectionText={objectionText}
               setObjectionText={setObjectionText}
               judgeRuling={judgeRuling}
               judgeRulingReason={judgeRulingReason}
+              judgeRulingAnalysis={judgeRulingAnalysis}
+              judgeRulingEffect={judgeRulingEffect}
               judgeStatus={judgeStatus}
               setJudgeStatus={setJudgeStatus}
               submitObjection={submitObjection}
@@ -1271,12 +1397,6 @@ export default function App() {
               label="NEXT"
               onClick={goNext}
               isActive={phaseIndex === TRIAL_PHASES.length - 1}
-              disabled={!sessionId || isLoading}
-            />
-            <ControlBtn
-              icon={<Pause className="w-5 h-5" />}
-              label="VERDICT"
-              onClick={handleFastForward}
               disabled={!sessionId || isLoading}
             />
             <ControlBtn
@@ -1937,17 +2057,20 @@ function SimulationView({
   voiceCommandStatus,
   voiceCommandMessage,
   lastVoiceCommand,
+  isTestingVoice,
   onToggleVoiceControl,
+  onTestVoice,
   onPauseVoiceControl,
   onViewEvidence,
   onViewTranscript,
-  onFastForward,
   isObjecting,
   setIsObjecting,
   objectionText,
   setObjectionText,
   judgeRuling,
   judgeRulingReason,
+  judgeRulingAnalysis,
+  judgeRulingEffect,
   judgeStatus,
   setJudgeStatus,
   submitObjection,
@@ -1961,17 +2084,20 @@ function SimulationView({
   voiceCommandStatus: VoiceModeStatus;
   voiceCommandMessage: string;
   lastVoiceCommand: string;
+  isTestingVoice: boolean;
   onToggleVoiceControl: () => void;
+  onTestVoice: () => void;
   onPauseVoiceControl: () => Promise<void>;
   onViewEvidence: () => void;
   onViewTranscript: () => void;
-  onFastForward: () => void;
   isObjecting: boolean;
   setIsObjecting: (v: boolean) => void;
   objectionText: string;
   setObjectionText: (v: string) => void;
   judgeRuling: null | 'SUSTAINED' | 'OVERRULED';
   judgeRulingReason: string;
+  judgeRulingAnalysis: string;
+  judgeRulingEffect: string;
   judgeStatus: 'LISTENING' | 'EVALUATING' | 'RULING' | 'HALTED';
   setJudgeStatus: (v: 'LISTENING' | 'EVALUATING' | 'RULING' | 'HALTED') => void;
   submitObjection: () => void;
@@ -1989,9 +2115,19 @@ function SimulationView({
   });
 
   const transcript = trialState?.transcript || [];
-  const prosecutionLatest = [...transcript].reverse().find((entry) => entry.agent === 'prosecution');
-  const defenseLatest = [...transcript].reverse().find((entry) => entry.agent === 'defense');
+  const prosecutionLatest = [...transcript]
+    .reverse()
+    .find((entry) => entry.agent === 'prosecution' && !isProceduralTranscriptEntry(entry));
+  const defenseLatest = [...transcript]
+    .reverse()
+    .find((entry) => entry.agent === 'defense' && !isProceduralTranscriptEntry(entry));
   const judgeLatest = [...transcript].reverse().find((entry) => entry.agent === 'judge');
+  const prosecutionDisplay = prosecutionLatest?.redacted
+    ? '[STRUCK FROM RECORD AFTER SUSTAINED OBJECTION]'
+    : prosecutionLatest?.content;
+  const defenseDisplay = defenseLatest?.redacted
+    ? '[STRUCK FROM RECORD AFTER SUSTAINED OBJECTION]'
+    : defenseLatest?.content;
 
   const objections = useMemo(() => {
     return transcript.reduce(
@@ -2099,20 +2235,21 @@ function SimulationView({
           message: `Preparing ${formatAgent(latestCounselEntry.agent)} voice output.`,
           agent: latestCounselEntry.agent,
         });
+        unlockAudio();
         synth.cancel();
         synth.resume();
         if (isSpeechBlocked()) return;
         synth.speak(utterance);
         const blockedTimeout = window.setTimeout(() => {
-          if (cancelled || synth.speaking) return;
+          if (cancelled || synth.speaking || synth.pending) return;
           spokenEntriesRef.current.delete(spokenKey);
           const vapiReason = vapiFallbackErrorRef.current ? ` Last Vapi error: ${vapiFallbackErrorRef.current}` : '';
           setSpeechState({
             status: 'blocked',
-            message: `Speech did not start. Browser autoplay or voice permissions may be blocking TTS.${vapiReason}`,
+            message: `Speech did not start. Click once on the page and try NEXT again.${vapiReason}`,
             agent: latestCounselEntry.agent,
           });
-        }, 400);
+        }, 1500);
         browserCleanup = () => {
           window.clearTimeout(blockedTimeout);
           synth.cancel();
@@ -2151,6 +2288,27 @@ function SimulationView({
           agent: latestCounselEntry.agent,
         });
         await onPauseVoiceControl();
+      }
+
+      const counselRole = latestCounselEntry.agent as Extract<BackendAgentRole, 'prosecution' | 'defense'>;
+      if (VAPI_PUBLIC_KEY && hasVapiVoice(counselRole)) {
+        setSpeechState({
+          status: 'loading-voices',
+          message: `Starting Vapi narration for ${formatAgent(counselRole)}...`,
+          agent: counselRole,
+        });
+        try {
+          await speakWithVapi(counselRole, latestCounselEntry.content);
+          if (cancelled) return;
+          setSpeechState({
+            status: 'idle',
+            message: `${formatAgent(counselRole)} delivered via Vapi voice.`,
+            agent: counselRole,
+          });
+          return;
+        } catch (error) {
+          vapiFallbackErrorRef.current = parseError(error);
+        }
       }
 
       speakWithBrowserFallback();
@@ -2249,6 +2407,16 @@ function SimulationView({
             >
               {isVoiceControlEnabled ? 'Stop Voice Commands' : 'Start Voice Commands'}
             </button>
+            <button
+              onClick={onTestVoice}
+              disabled={isTestingVoice}
+              className={cn(
+                'w-full mt-1 px-2 py-1 text-[8px] tracking-[0.25em] uppercase border transition-colors disabled:opacity-40 disabled:cursor-not-allowed',
+                'border-primary/40 text-outline hover:border-primary hover:text-primary',
+              )}
+            >
+              {isTestingVoice ? 'Testing Voice...' : 'Test Voice'}
+            </button>
             {isVoiceControlEnabled && (
               <p className="text-[8px] normal-case text-outline/80 mt-1">
                 Narration auto-pauses command mode when a counsel speech turn starts.
@@ -2281,7 +2449,7 @@ function SimulationView({
                   </div>
                   <div className="w-full max-w-xl border border-primary/20 bg-background/40 px-4 py-5 md:px-6 md:py-6 space-y-4 text-center max-h-[52vh] overflow-y-auto">
                     <h3 className="font-sans text-2xl font-extrabold tracking-tighter uppercase">{prosecutionLatest?.stage.replace('_', ' ') || 'Opening Statement'}</h3>
-                    <p className="text-sm leading-relaxed text-outline normal-case whitespace-pre-wrap break-words">{prosecutionLatest?.content || 'Awaiting prosecution argument from backend session.'}</p>
+                    <p className="text-sm leading-relaxed text-outline normal-case whitespace-pre-wrap break-words">{prosecutionDisplay || 'Awaiting prosecution argument from backend session.'}</p>
                     {prosecutionLatest && <EntryMeta entry={prosecutionLatest} />}
                   </div>
                 </div>
@@ -2300,7 +2468,7 @@ function SimulationView({
                   </div>
                   <div className="w-full max-w-xl border border-primary/20 bg-background/30 px-4 py-5 md:px-6 md:py-6 space-y-4 text-center max-h-[52vh] overflow-y-auto opacity-70">
                     <h3 className="font-sans text-2xl font-extrabold tracking-tighter uppercase">{defenseLatest?.stage.replace('_', ' ') || 'Opening Statement'}</h3>
-                    <p className="text-sm leading-relaxed normal-case whitespace-pre-wrap break-words">{defenseLatest?.content || 'Awaiting defense response from backend session.'}</p>
+                    <p className="text-sm leading-relaxed normal-case whitespace-pre-wrap break-words">{defenseDisplay || 'Awaiting defense response from backend session.'}</p>
                     {defenseLatest && <EntryMeta entry={defenseLatest} />}
                   </div>
                 </div>
@@ -2381,15 +2549,6 @@ function SimulationView({
           <span className="text-sm font-extrabold font-mono leading-none tracking-wider text-primary">{trialPhase.replace('_', ' ')}</span>
         </div>
 
-        <div className="flex items-center justify-center px-4">
-          <button
-            onClick={onFastForward}
-            disabled={isLoading}
-            className="text-[9px] tracking-[0.2em] px-3 py-2 border border-primary/40 hover:border-primary hover:text-primary transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            FAST FORWARD
-          </button>
-        </div>
       </div>
 
       {/* ── Objection Input Modal ────────────────────────────────────── */}
@@ -2482,11 +2641,29 @@ function SimulationView({
                   ? 'OBJECTION SUSTAINED. STRIKING FROM RECORD.'
                   : 'OBJECTION OVERRULED. COUNSEL, PROCEED.'}
               </p>
-              {judgeRulingReason && (
-                <p className="text-xs text-outline font-mono tracking-wider leading-relaxed max-w-lg mx-auto mt-2">
-                  &ldquo;{judgeRulingReason}&rdquo;
-                </p>
-              )}
+                  {judgeRulingReason && (
+                    <p className="text-xs text-outline font-mono tracking-wider leading-relaxed max-w-lg mx-auto mt-2">
+                      &ldquo;{judgeRulingReason}&rdquo;
+                    </p>
+                  )}
+                  {judgeRulingAnalysis && (
+                    <p className="text-[11px] text-outline/90 font-mono normal-case tracking-wide leading-relaxed max-w-xl mx-auto mt-1">
+                      {judgeRulingAnalysis}
+                    </p>
+                  )}
+                  {judgeRulingEffect && (
+                    <p className={cn(
+                      'text-[10px] font-mono tracking-widest uppercase mt-1',
+                      judgeRuling === 'SUSTAINED' ? 'text-primary' : 'text-outline',
+                    )}>
+                      {judgeRulingEffect}
+                    </p>
+                  )}
+                  {(judgeRuling === 'SUSTAINED' && !judgeRulingEffect) && (
+                    <p className="text-[10px] font-mono tracking-widest uppercase mt-1 text-primary">
+                      Challenged opposing statement has been struck from record.
+                    </p>
+                  )}
               <div className={cn(
                 "h-px w-full",
                 judgeRuling === 'SUSTAINED' ? "bg-primary/30" : "bg-red-500/30"
@@ -2766,7 +2943,7 @@ function VerdictScreen({
 
   const verdictScript = useMemo(() => {
     if (!judgeStatement && !verdict) {
-      return 'Awaiting final judicial statement. Use VERDICT or FAST FORWARD to request final ruling.';
+      return 'Awaiting final judicial statement as proceedings conclude.';
     }
     return buildVerdictTranscript(verdictView);
   }, [judgeStatement, verdict, verdictView]);

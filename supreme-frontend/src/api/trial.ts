@@ -39,12 +39,6 @@ export function forceVerdict(sessionId: string): Promise<VerdictResponse> {
   });
 }
 
-export function fastForward(sessionId: string): Promise<VerdictResponse> {
-  return request<VerdictResponse>(`/api/session/${sessionId}/fast-forward`, {
-    method: 'POST',
-  });
-}
-
 export function resetTrial(sessionId: string): Promise<CreateCaseResponse> {
   return request<CreateCaseResponse>(`/api/session/${sessionId}/reset`, {
     method: 'POST',

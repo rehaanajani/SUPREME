@@ -63,6 +63,10 @@ export interface Verdict {
 export interface ObjectionRuling {
   ruling: 'SUSTAINED' | 'OVERRULED';
   reason: string;
+  analysis?: string | null;
+  challenged_entry_id?: string | null;
+  challenged_agent?: AgentRole | null;
+  effect?: string | null;
   timestamp: string;
 }
 

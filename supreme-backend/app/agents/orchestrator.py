@@ -30,6 +30,12 @@ from app.tools.llm import generate_response_with_trace
 
 logger = logging.getLogger(__name__)
 
+_OBJECTION_PREFIX_RE = re.compile(r"^\s*object(?:ion)?\b[\s:,-]*", re.IGNORECASE)
+_POLITE_PREFIX_RE = re.compile(
+    r"^\s*(your\s+honou?r|your\s+lordship|my\s+lord|my\s+lady)\b[\s,:-]*",
+    re.IGNORECASE,
+)
+
 # Ordered stages for the full trial flow
 STAGE_ORDER: list[TrialStage] = [
     TrialStage.OPENING_PROS,
@@ -97,6 +103,118 @@ def _parse_verdict(raw: str) -> Verdict:
         key_factors=factors[:5],
         confidence=round(confidence, 2),
     )
+
+
+def _is_procedural_entry(entry: TranscriptEntry) -> bool:
+    upper = entry.content.strip().upper()
+    return upper.startswith("OBJECTION:") or upper.startswith("RULING:")
+
+
+def _extract_objection_reason(payload: str | None) -> str:
+    if not payload:
+        return ""
+
+    text = payload.strip()
+    text = _OBJECTION_PREFIX_RE.sub("", text, count=1).strip()
+    text = _POLITE_PREFIX_RE.sub("", text, count=1).strip()
+    text = re.sub(r"[.?!]+$", "", text).strip()
+    if not text:
+        return ""
+
+    generic = {
+        "objection",
+        "object",
+        "your honour",
+        "your honor",
+        "your lordship",
+        "my lord",
+        "my lady",
+    }
+    if text.lower() in generic:
+        return ""
+    return text
+
+
+def _find_latest_counsel_statement(state: TrialState) -> TranscriptEntry | None:
+    for entry in reversed(state.transcript):
+        if entry.agent not in (AgentRole.PROSECUTION, AgentRole.DEFENSE):
+            continue
+        if entry.redacted or _is_procedural_entry(entry):
+            continue
+        return entry
+    return None
+
+
+def _find_challenged_statement(state: TrialState, challenged_agent: AgentRole) -> TranscriptEntry | None:
+    for entry in reversed(state.transcript):
+        if entry.agent != challenged_agent:
+            continue
+        if entry.redacted or _is_procedural_entry(entry):
+            continue
+        return entry
+
+    for entry in reversed(state.transcript):
+        if entry.agent not in (AgentRole.PROSECUTION, AgentRole.DEFENSE):
+            continue
+        if entry.redacted or _is_procedural_entry(entry):
+            continue
+        return entry
+    return None
+
+
+def _parse_objection_ruling(raw_ruling: str) -> tuple[str, str, str]:
+    text = raw_ruling.strip()
+
+    decision = "OVERRULED"
+    decision_match = re.search(
+        r"(?:^|\n)\s*DECISION\s*:\s*(SUSTAINED|OVERRULED)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if decision_match:
+        decision = decision_match.group(1).upper()
+    else:
+        upper = text.upper()
+        if upper.startswith("SUSTAINED"):
+            decision = "SUSTAINED"
+        elif upper.startswith("OVERRULED"):
+            decision = "OVERRULED"
+
+    reason_match = re.search(
+        r"(?:^|\n)\s*REASON\s*:\s*(.+?)(?=\n\s*ANALYSIS\s*:|\Z)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    analysis_match = re.search(
+        r"(?:^|\n)\s*ANALYSIS\s*:\s*(.+)$",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    reason = ""
+    if reason_match:
+        reason = " ".join(reason_match.group(1).strip().split())
+    else:
+        first_line = text.splitlines()[0].strip() if text else ""
+        if "." in first_line:
+            reason = first_line.split(".", 1)[1].strip()
+        elif " " in first_line:
+            reason = first_line.split(" ", 1)[1].strip()
+
+    analysis = ""
+    if analysis_match:
+        analysis = " ".join(analysis_match.group(1).strip().split())
+    elif text:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if len(lines) > 1:
+            analysis = " ".join(lines[1:])
+
+    if not reason:
+        reason = "The objection does not justify striking the challenged statement."
+    if not analysis:
+        analysis = reason
+
+    return decision, reason, analysis
 
 
 # ── Core Orchestrator ─────────────────────────────────────────────────────────
@@ -174,12 +292,18 @@ async def handle_objection(state: TrialState, payload: str | None) -> tuple[Tria
 
     If SUSTAINED, the last non-objection entry is marked as redacted.
     """
-    objecting_agent = (
-        AgentRole.DEFENSE
-        if state.active_agent == AgentRole.PROSECUTION
-        else AgentRole.PROSECUTION
+    objection_reason = _extract_objection_reason(payload)
+    objection_text = objection_reason or "No legal ground stated."
+    challenged_statement = _find_latest_counsel_statement(state)
+    challenged_agent = challenged_statement.agent if challenged_statement else (
+        state.active_agent if state.active_agent in (AgentRole.PROSECUTION, AgentRole.DEFENSE) else AgentRole.PROSECUTION
     )
-    objection_text = payload or "Objection, Your Honour — counsel's statement is improper."
+    if challenged_statement is None:
+        challenged_statement = _find_challenged_statement(state, challenged_agent)
+    objecting_agent = (
+        AgentRole.DEFENSE if challenged_agent == AgentRole.PROSECUTION else AgentRole.PROSECUTION
+    )
+
     entry = TranscriptEntry(
         agent=objecting_agent,
         stage=state.stage,
@@ -189,67 +313,73 @@ async def handle_objection(state: TrialState, payload: str | None) -> tuple[Tria
     state.transcript.append(entry)
     state.updated_at = datetime.utcnow()
 
-    # ── Find the last non-objection statement to evaluate against ─────
-    last_statement = None
-    for te in reversed(state.transcript):
-        if not te.content.startswith("OBJECTION:") and not te.redacted:
-            last_statement = te
-            break
-
-    context_text = last_statement.content if last_statement else "No prior statement."
-
-    # ── Ask LLM judge to rule on the objection ───────────────────────
-    judge_system = (
-        "You are the Presiding Judge in a courtroom trial. "
-        "An attorney has raised an objection.  You must decide whether it is "
-        "SUSTAINED (the objection is valid — the challenged statement is struck) or "
-        "OVERRULED (the objection is invalid — the statement stands).\n\n"
-        "Rules:\n"
-        "- Evaluate the objection grounds against standard rules of evidence.\n"
-        "- Respond with exactly one line starting with SUSTAINED or OVERRULED, "
-        "followed by a brief reason (1-2 sentences).\n"
-        "- Be authoritative and decisive.\n"
-    )
-    judge_prompt = (
-        f"CHALLENGED STATEMENT ({last_statement.agent.upper() if last_statement else 'unknown'}):\n"
-        f"{context_text}\n\n"
-        f"OBJECTION RAISED BY {objecting_agent.upper()}:\n"
-        f"{objection_text}\n\n"
-        "Deliver your ruling. Start with SUSTAINED or OVERRULED."
-    )
-
-    try:
-        raw_ruling, _ = await generate_response_with_trace(
-            system_prompt=judge_system,
-            user_prompt=judge_prompt,
-        )
-    except Exception as exc:
-        logger.warning("LLM objection ruling failed: %s — defaulting to OVERRULED.", exc)
-        raw_ruling = "OVERRULED. The court cannot evaluate this objection at this time."
-
-    # ── Parse ruling ─────────────────────────────────────────────────
-    raw_upper = raw_ruling.strip().upper()
-    if raw_upper.startswith("SUSTAINED"):
-        ruling_decision = "SUSTAINED"
-    else:
+    if not objection_reason:
         ruling_decision = "OVERRULED"
+        reason_text = "No legal ground was stated for the objection."
+        analysis_text = (
+            "The court requires a specific evidentiary basis before it can strike opposing "
+            "counsel's submission. State grounds such as hearsay, relevance, speculation, "
+            "or leading question."
+        )
+    else:
+        context_text = challenged_statement.content if challenged_statement else "No prior opposing statement."
 
-    # Extract reason: everything after the first word
-    reason_text = raw_ruling.strip()
-    first_dot = reason_text.find(".")
-    if first_dot != -1 and first_dot < len(reason_text) - 1:
-        reason_text = reason_text[first_dot + 1:].strip()
-    elif " " in reason_text:
-        reason_text = reason_text.split(" ", 1)[1].strip()
+        judge_system = (
+            "You are the Presiding Judge in a courtroom trial. "
+            "Rule on objections using standard rules of evidence.\n\n"
+            "Output format (exact keys):\n"
+            "DECISION: SUSTAINED or OVERRULED\n"
+            "REASON: One concise sentence\n"
+            "ANALYSIS: Two to four concise sentences grounded in evidentiary rules.\n"
+            "Be decisive and avoid hedging."
+        )
+        judge_prompt = (
+            f"CHALLENGED STATEMENT ({challenged_statement.agent.upper() if challenged_statement else challenged_agent.upper()}):\n"
+            f"{context_text}\n\n"
+            f"OBJECTION RAISED BY {objecting_agent.upper()}:\n"
+            f"{objection_reason}\n\n"
+            "Decide whether the challenged statement should remain in the record."
+        )
 
-    # If sustained, redact the challenged statement
-    if ruling_decision == "SUSTAINED" and last_statement:
-        last_statement.redacted = True
-        logger.info("Objection SUSTAINED — redacted entry %s.", last_statement.id)
+        try:
+            raw_ruling, _ = await generate_response_with_trace(
+                system_prompt=judge_system,
+                user_prompt=judge_prompt,
+            )
+        except Exception as exc:
+            logger.warning("LLM objection ruling failed: %s — defaulting to OVERRULED.", exc)
+            raw_ruling = (
+                "DECISION: OVERRULED\n"
+                "REASON: The court cannot evaluate this objection at this time.\n"
+                "ANALYSIS: The objection is not sustained because the analysis service was unavailable."
+            )
+
+        ruling_decision, reason_text, analysis_text = _parse_objection_ruling(raw_ruling)
+
+    effect_text = "The challenged statement remains in the record."
+    if ruling_decision == "SUSTAINED" and challenged_statement:
+        challenged_statement.redacted = True
+        effect_text = (
+            f"The challenged {challenged_statement.agent.upper()} statement was struck "
+            "from the active record."
+        )
+        logger.info("Objection SUSTAINED — redacted entry %s.", challenged_statement.id)
+    elif ruling_decision == "SUSTAINED" and not challenged_statement:
+        ruling_decision = "OVERRULED"
+        reason_text = "No opposing statement was available to strike."
+        analysis_text = (
+            "Although a ground was presented, there is no challengeable opposing statement "
+            "currently in the transcript."
+        )
+        effect_text = "No transcript entry was modified."
 
     ruling = ObjectionRuling(
         ruling=ruling_decision,
-        reason=reason_text or "The court has ruled.",
+        reason=reason_text,
+        analysis=analysis_text,
+        challenged_entry_id=challenged_statement.id if challenged_statement else None,
+        challenged_agent=challenged_statement.agent if challenged_statement else challenged_agent,
+        effect=effect_text,
         timestamp=datetime.utcnow(),
     )
 

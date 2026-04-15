@@ -107,9 +107,13 @@ async def control(session_id: str, req: ControlRequest) -> ControlResponse:
     objection_ruling = None
 
     if req.action == ControlAction.OBJECTION:
-        state, objection_ruling = await handle_objection(state, req.payload)
+        if not req.payload or not req.payload.strip():
+            raise HTTPException(status_code=400, detail="Objection requires a legal reason in 'payload'.")
+        state, objection_ruling = await handle_objection(state, req.payload.strip())
         ruling_label = objection_ruling.ruling if objection_ruling else "NOTED"
         result = f"Objection {ruling_label}. {objection_ruling.reason if objection_ruling else ''}"
+        if objection_ruling and objection_ruling.effect:
+            result = f"{result} {objection_ruling.effect}"
 
     elif req.action == ControlAction.REDACT:
         if not req.payload:
@@ -151,6 +155,9 @@ async def force_verdict(session_id: str) -> VerdictResponse:
     state, _ = await run_verdict(state)
     await _save(state)
 
+    if not state.verdict:
+        raise HTTPException(status_code=500, detail="Verdict generation failed.")
+
     return VerdictResponse(
         session_id=session_id,
         verdict=state.verdict,
@@ -181,6 +188,9 @@ async def fast_forward_trial(session_id: str) -> VerdictResponse:
     state = await _load_or_404(session_id)
     state, _ = await fast_forward(state)
     await _save(state)
+
+    if not state.verdict:
+        raise HTTPException(status_code=500, detail="Verdict generation failed.")
 
     return VerdictResponse(
         session_id=session_id,
