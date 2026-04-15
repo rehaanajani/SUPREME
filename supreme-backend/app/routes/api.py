@@ -4,15 +4,21 @@ app/routes/api.py — All FastAPI route definitions for SUPREME.
 
 from __future__ import annotations
 
-from fastapi import APIRouter
-from fastapi.responses import JSONResponse
+from time import perf_counter
 
+from fastapi import APIRouter
+from fastapi import Header
+from fastapi import HTTPException
 from app.models.trial import (
     ControlRequest,
     CreateCaseRequest,
+    SessionResponse,
 )
+from app.observability.diagnostics import build_request_diagnostics
+from app.serializers.trial_state import serialize_public_state
 from app.services import trial_service
 from app.tools.rag import rag_diagnostics
+from config import DEBUG_API_TOKEN
 
 router = APIRouter()
 
@@ -25,8 +31,10 @@ async def health():
 
 
 @router.get("/api/debug/rag", tags=["debug"])
-async def debug_rag():
+async def debug_rag(x_debug_token: str | None = Header(default=None)):
     """Inspect current RAG + Qdrant runtime health."""
+    if DEBUG_API_TOKEN and x_debug_token != DEBUG_API_TOKEN:
+        raise HTTPException(status_code=403, detail="Missing or invalid debug token.")
     return rag_diagnostics()
 
 
@@ -38,11 +46,20 @@ async def create_case(req: CreateCaseRequest):
     return await trial_service.create_case(req)
 
 
-@router.get("/api/session/{session_id}", tags=["trial"])
+@router.post("/api/case/", tags=["trial"], include_in_schema=False)
+async def create_case_with_trailing_slash(req: CreateCaseRequest):
+    """Compatibility alias for clients posting to /api/case/."""
+    return await trial_service.create_case(req)
+
+
+@router.get("/api/session/{session_id}", tags=["trial"], response_model=SessionResponse)
 async def get_session(session_id: str):
     """Return the full transcript and current state for a session."""
+    started_at = perf_counter() * 1000
     state = await trial_service.get_session(session_id)
-    return state.model_dump()
+    payload = serialize_public_state(state)
+    payload["diagnostics"] = build_request_diagnostics(started_at)
+    return payload
 
 
 # ── Turn-by-turn control ────────────────────────────────────────────────────────

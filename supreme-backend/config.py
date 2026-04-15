@@ -8,6 +8,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _parse_cors_origins(raw_value: str | None) -> list[str]:
+    default_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    if not raw_value:
+        return default_origins
+
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for origin in raw_value.split(","):
+        normalized = origin.strip().rstrip("/")
+        if normalized and normalized not in seen:
+            parsed.append(normalized)
+            seen.add(normalized)
+
+    return parsed or default_origins
+
 # ── OpenRouter (LLM) ──────────────────────────────────────────────────────────
 OPENROUTER_API_KEY: str  = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1/chat/completions"
@@ -41,10 +57,9 @@ APP_PORT:   int  = int(os.getenv("APP_PORT", "8000"))
 DEMO_MODE:  bool = os.getenv("DEMO_MODE", "true").lower() == "true"
 APP_LOG_LEVEL: str = os.getenv("APP_LOG_LEVEL", "INFO").upper()
 ENABLE_RAG_DEBUG: bool = os.getenv("ENABLE_RAG_DEBUG", "false").lower() == "true"
-CORS_ORIGINS: list[str] = [
-    origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
-    if origin.strip()
-]
+EXPOSE_DEBUG_TRACES: bool = os.getenv("EXPOSE_DEBUG_TRACES", "false").lower() == "true"
+DEBUG_API_TOKEN: str = os.getenv("DEBUG_API_TOKEN", "")
+CORS_ORIGINS: list[str] = _parse_cors_origins(os.getenv("CORS_ORIGINS"))
 
 # ── Vapi (optional voice layer) ───────────────────────────────────────────────
 VAPI_API_KEY:           str  = os.getenv("VAPI_API_KEY", "")

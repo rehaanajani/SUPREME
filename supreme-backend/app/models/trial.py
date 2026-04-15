@@ -28,6 +28,7 @@ class AgentRole(str, Enum):
     PROSECUTION = "prosecution"
     DEFENSE     = "defense"
     JUDGE       = "judge"
+    WITNESS     = "witness"
 
 
 class Difficulty(str, Enum):
@@ -40,6 +41,11 @@ class ControlAction(str, Enum):
     OBJECTION        = "objection"
     REDACT           = "redact"
     INJECT_TESTIMONY = "inject_testimony"
+
+
+class ObjectionDecision(str, Enum):
+    SUSTAINED = "SUSTAINED"
+    OVERRULED = "OVERRULED"
 
 
 # ── Sub-models ────────────────────────────────────────────────────────────────
@@ -66,6 +72,26 @@ class AgentDebugTrace(BaseModel):
     final_output: str = ""
 
 
+class DiagnosticsTiming(BaseModel):
+    total: int
+
+
+class DiagnosticsModel(BaseModel):
+    id: Optional[str] = None
+    provider: str = "openrouter"
+
+
+class DiagnosticsRag(BaseModel):
+    source: Optional[str] = None
+
+
+class RequestDiagnostics(BaseModel):
+    request_id: str
+    timings_ms: DiagnosticsTiming
+    model: Optional[DiagnosticsModel] = None
+    rag: Optional[DiagnosticsRag] = None
+
+
 class TranscriptEntry(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     agent: AgentRole
@@ -83,6 +109,7 @@ class CaseDetails(BaseModel):
     description: str
     charges: list[str]
     evidence: list[str]
+    plea: Optional[str] = None
     difficulty: Difficulty = Difficulty.MEDIUM
 
 
@@ -111,6 +138,7 @@ class TrialState(BaseModel):
 
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+    version: int = 0
 
     class Config:
         use_enum_values = True
@@ -123,6 +151,7 @@ class CreateCaseRequest(BaseModel):
     description: str
     charges: list[str]
     evidence: list[str]
+    plea: Optional[str] = None
     difficulty: Difficulty = Difficulty.MEDIUM
 
 
@@ -137,22 +166,36 @@ class ControlRequest(BaseModel):
     payload: Optional[str] = None    # text for injection / redact target
 
 
+class ObjectionRuling(BaseModel):
+    decision: ObjectionDecision
+    reason: str
+    code: Optional[str] = None
+
+
 class ControlResponse(BaseModel):
     session_id: str
     action: ControlAction
     result: str
-    state: Any                       # serialised TrialState snapshot
+    state: TrialState
+    objection: Optional[ObjectionRuling] = None
+    diagnostics: Optional[RequestDiagnostics] = None
 
 
 class NextTurnResponse(BaseModel):
     session_id: str
     entry: TranscriptEntry
-    stage: str
-    active_agent: str
+    stage: TrialStage
+    active_agent: AgentRole
     is_complete: bool
+    diagnostics: Optional[RequestDiagnostics] = None
+
+
+class SessionResponse(TrialState):
+    diagnostics: Optional[RequestDiagnostics] = None
 
 
 class VerdictResponse(BaseModel):
     session_id: str
     verdict: Verdict
     transcript_length: int
+    diagnostics: Optional[RequestDiagnostics] = None

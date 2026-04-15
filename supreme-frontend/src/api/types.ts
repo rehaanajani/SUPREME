@@ -1,6 +1,6 @@
 export type Difficulty = 'easy' | 'medium' | 'hard';
 
-export type AgentRole = 'prosecution' | 'defense' | 'judge';
+export type AgentRole = 'prosecution' | 'defense' | 'judge' | 'witness';
 
 export type TrialStage =
   | 'OPENING_PROS'
@@ -13,6 +13,8 @@ export type TrialStage =
   | 'COMPLETE';
 
 export type ControlAction = 'objection' | 'redact' | 'inject_testimony';
+
+export type ObjectionDecision = 'SUSTAINED' | 'OVERRULED';
 
 export interface Citation {
   case_id: string;
@@ -36,6 +38,20 @@ export interface AgentDebugTrace {
   final_output: string;
 }
 
+export interface Diagnostics {
+  request_id: string;
+  timings_ms: {
+    total: number;
+  };
+  model?: {
+    id?: string | null;
+    provider: string;
+  } | null;
+  rag?: {
+    source?: string | null;
+  } | null;
+}
+
 export interface TranscriptEntry {
   id: string;
   agent: AgentRole;
@@ -53,6 +69,7 @@ export interface CaseDetails {
   description: string;
   charges: string[];
   evidence: string[];
+  plea?: string | null;
   difficulty: Difficulty;
 }
 
@@ -76,11 +93,16 @@ export interface TrialState {
   updated_at: string;
 }
 
+export interface SessionResponse extends TrialState {
+  diagnostics?: Diagnostics | null;
+}
+
 export interface CreateCaseRequest {
   title: string;
   description: string;
   charges: string[];
   evidence: string[];
+  plea?: string;
   difficulty?: Difficulty;
 }
 
@@ -96,6 +118,7 @@ export interface NextTurnResponse {
   stage: TrialStage;
   active_agent: AgentRole;
   is_complete: boolean;
+  diagnostics?: Diagnostics | null;
 }
 
 export interface ControlRequest {
@@ -108,10 +131,17 @@ export interface ControlResponse {
   action: ControlAction;
   result: string;
   state: TrialState;
+  objection?: {
+    decision: ObjectionDecision;
+    reason: string;
+    code?: string | null;
+  } | null;
+  diagnostics?: Diagnostics | null;
 }
 
 export interface VerdictResponse {
   session_id: string;
   verdict: Verdict;
   transcript_length: number;
+  diagnostics?: Diagnostics | null;
 }

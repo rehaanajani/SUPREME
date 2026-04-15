@@ -64,8 +64,11 @@ def _build_prosecution_prompt(
     recent_transcript: str,
     citations: str,
 ) -> str:
+    plea = case.plea or "NOT SPECIFIED"
     return (
         f"CASE: {case.title}\n"
+        f"CASE CONTEXT: {case.description}\n"
+        f"PLEA ENTERED: {plea}\n"
         f"CHARGES: {', '.join(case.charges)}\n"
         f"KEY EVIDENCE: {', '.join(case.evidence)}\n"
         f"CURRENT STAGE: {stage}\n\n"
@@ -81,8 +84,11 @@ def _build_defense_prompt(
     recent_transcript: str,
     citations: str,
 ) -> str:
+    plea = case.plea or "NOT SPECIFIED"
     return (
         f"CASE: {case.title}\n"
+        f"CASE CONTEXT: {case.description}\n"
+        f"CLIENT PLEA: {plea}\n"
         f"CHARGES AGAINST CLIENT: {', '.join(case.charges)}\n"
         f"PROSECUTION EVIDENCE (to counter): {', '.join(case.evidence)}\n"
         f"CURRENT STAGE: {stage}\n\n"
@@ -93,8 +99,11 @@ def _build_defense_prompt(
 
 
 def _build_judge_prompt(case: CaseDetails, full_transcript: str) -> str:
+    plea = case.plea or "NOT SPECIFIED"
     return (
         f"CASE: {case.title}\n"
+        f"CASE CONTEXT: {case.description}\n"
+        f"PLEA ENTERED: {plea}\n"
         f"CHARGES: {', '.join(case.charges)}\n\n"
         f"FULL TRIAL TRANSCRIPT:\n{full_transcript}\n\n"
         "Deliver the final verdict. Be decisive and structured: "
@@ -103,9 +112,14 @@ def _build_judge_prompt(case: CaseDetails, full_transcript: str) -> str:
     )
 
 
-def _format_transcript(entries: list[TranscriptEntry], redacted_view: bool) -> str:
+def _format_transcript(
+    entries: list[TranscriptEntry],
+    redacted_view: bool,
+    max_entries: int | None = 10,
+) -> str:
     lines: list[str] = []
-    for entry in entries[-10:]:
+    selected_entries = entries if max_entries is None else entries[-max_entries:]
+    for entry in selected_entries:
         if redacted_view and entry.redacted:
             lines.append(f"[{entry.agent.upper()}] [REDACTED]")
         else:
@@ -129,7 +143,7 @@ async def run_prosecution(
 ) -> TranscriptEntry:
     query = f"{case.title} {' '.join(case.charges)} {stage}"
     citations, rag_trace = await retrieve_precedents_with_trace(query, AgentRole.PROSECUTION)
-    recent = _format_transcript(transcript, redacted_view=True)
+    recent = _format_transcript(transcript, redacted_view=True, max_entries=10)
     citation_text = _format_citations(citations)
     user_prompt = _build_prosecution_prompt(case, stage, recent, citation_text)
     content, llm_traces = await generate_response_with_trace(
@@ -159,7 +173,7 @@ async def run_defense(
 ) -> TranscriptEntry:
     query = f"{case.title} {' '.join(case.charges)} {stage} acquittal"
     citations, rag_trace = await retrieve_precedents_with_trace(query, AgentRole.DEFENSE)
-    recent = _format_transcript(transcript, redacted_view=True)
+    recent = _format_transcript(transcript, redacted_view=True, max_entries=10)
     citation_text = _format_citations(citations)
     user_prompt = _build_defense_prompt(case, stage, recent, citation_text)
     content, llm_traces = await generate_response_with_trace(
@@ -186,7 +200,7 @@ async def run_judge(
     case: CaseDetails,
     transcript: list[TranscriptEntry],
 ) -> tuple[str, AgentDebugTrace]:
-    full = _format_transcript(transcript, redacted_view=False)
+    full = _format_transcript(transcript, redacted_view=False, max_entries=None)
     user_prompt = _build_judge_prompt(case, full)
     content, llm_traces = await generate_response_with_trace(
         system_prompt=_JUDGE_SYSTEM,

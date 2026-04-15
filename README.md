@@ -54,7 +54,8 @@ DEMO_MODE=true
 
 ### Frontend (`supreme-frontend/.env`)
 ```
-VITE_VAPI_API_KEY=...
+VITE_API_BASE_URL=http://localhost:8000
+VITE_DEBUG_API=false
 ```
 
 ---

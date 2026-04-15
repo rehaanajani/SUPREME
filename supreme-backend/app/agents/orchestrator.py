@@ -20,6 +20,8 @@ from datetime import datetime
 from app.agents.runners import run_defense, run_judge, run_prosecution
 from app.models.trial import (
     AgentRole,
+    ObjectionDecision,
+    ObjectionRuling,
     TranscriptEntry,
     TrialStage,
     TrialState,
@@ -168,7 +170,7 @@ async def fast_forward(state: TrialState) -> tuple[TrialState, TranscriptEntry]:
 
 # ── User control actions ──────────────────────────────────────────────────────
 
-async def handle_objection(state: TrialState, payload: str | None) -> TrialState:
+async def handle_objection(state: TrialState, payload: str | None) -> tuple[TrialState, ObjectionRuling]:
     """
     Insert an OBJECTION entry into the transcript.
     The objection is attributed to whichever agent is NOT currently speaking.
@@ -178,7 +180,46 @@ async def handle_objection(state: TrialState, payload: str | None) -> TrialState
         if state.active_agent == AgentRole.PROSECUTION
         else AgentRole.PROSECUTION
     )
-    objection_text = payload or "Objection, Your Honour — counsel's statement is improper."
+    objection_text = payload or "Objection, your honour, counsel's statement is improper."
+
+    keyword_codes = {
+        "hearsay": "HEARSAY",
+        "leading": "LEADING",
+        "speculation": "SPECULATION",
+        "relevance": "RELEVANCE",
+        "irrelevant": "RELEVANCE",
+        "argumentative": "ARGUMENTATIVE",
+        "compound": "COMPOUND",
+    }
+    lowered = objection_text.lower()
+    hit_code = next((code for token, code in keyword_codes.items() if token in lowered), None)
+    struck_count = 0
+    if hit_code:
+        ruling = ObjectionRuling(
+            decision=ObjectionDecision.SUSTAINED,
+            reason=(
+                "Specific evidentiary grounds were provided and the objection is sustained "
+                "pending counsel reframing. Matching statements have been struck from the record."
+            ),
+            code=hit_code,
+        )
+
+        if state.transcript:
+            for transcript_entry in reversed(state.transcript):
+                if transcript_entry.agent in (AgentRole.PROSECUTION, AgentRole.DEFENSE) and not transcript_entry.redacted:
+                    transcript_entry.redacted = True
+                    struck_count = 1
+                    break
+    else:
+        ruling = ObjectionRuling(
+            decision=ObjectionDecision.OVERRULED,
+            reason=(
+                "Grounds were not tied to a concrete evidentiary defect; the objection is overruled "
+                "and proceedings continue."
+            ),
+            code="INSUFFICIENT_GROUNDS",
+        )
+
     entry = TranscriptEntry(
         agent=objecting_agent,
         stage=state.stage,
@@ -186,8 +227,19 @@ async def handle_objection(state: TrialState, payload: str | None) -> TrialState
         timestamp=datetime.utcnow(),
     )
     state.transcript.append(entry)
+    ruling_entry = TranscriptEntry(
+        agent=AgentRole.JUDGE,
+        stage=state.stage,
+        content=(
+            f"RULING ON OBJECTION: {ruling.decision}. "
+            f"{ruling.reason}"
+            f"{' (1 statement struck.)' if struck_count else ''}"
+        ),
+        timestamp=datetime.utcnow(),
+    )
+    state.transcript.append(ruling_entry)
     state.updated_at = datetime.utcnow()
-    return state
+    return state, ruling
 
 
 async def handle_redact(state: TrialState, payload: str | None) -> TrialState:
@@ -213,14 +265,14 @@ async def handle_redact(state: TrialState, payload: str | None) -> TrialState:
 async def handle_inject(state: TrialState, payload: str | None) -> TrialState:
     """
     Inject user-supplied testimony directly into the transcript.
-    Attributed to a neutral WITNESS role (stored as prosecution for schema compat).
+    Attributed to a neutral witness role.
     """
     if not payload:
         logger.warning("Inject testimony called with empty payload — no-op.")
         return state
 
     entry = TranscriptEntry(
-        agent=AgentRole.PROSECUTION,   # closest neutral role in schema
+        agent=AgentRole.WITNESS,
         stage=state.stage,
         content=f"[WITNESS TESTIMONY — INJECTED]: {payload}",
         timestamp=datetime.utcnow(),

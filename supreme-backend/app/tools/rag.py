@@ -145,6 +145,7 @@ _BIAS_MAP = {
     AgentRole.PROSECUTION: "conviction",
     AgentRole.DEFENSE:     "acquittal",
     AgentRole.JUDGE:       None,   # judge sees everything
+    AgentRole.WITNESS:     None,
 }
 
 

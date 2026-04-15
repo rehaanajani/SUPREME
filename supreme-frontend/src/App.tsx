@@ -2,7 +2,6 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import { motion, AnimatePresence } from 'motion/react';
 import {
   Terminal,
-  Shield,
   Gavel,
   FolderOpen,
   FileText,
@@ -12,31 +11,42 @@ import {
   Pause,
   StepForward,
   Eraser,
-  Upload,
-  ArrowRight,
-  ChevronDown,
   Circle,
   Image,
   Film,
   FileSearch,
-  File,
   Filter,
   Clock,
   User,
-  Scale
+  Scale,
+  Menu,
+  PanelLeftClose,
+  PanelLeftOpen,
+  X,
+  Download,
+  Trash2,
 } from 'lucide-react';
 import { cn } from './lib/utils';
-import { ApiError } from './api/client';
+import {
+  ApiError,
+  type ApiTimelineEvent,
+  clearApiTimeline,
+  getApiTimelineSnapshot,
+  subscribeApiTimeline,
+} from './api/client';
+import ConfigurationView, { type ConfigurationSidebarState } from './features/configuration/ConfigurationView';
 import {
   control,
   createCase,
   fastForward,
+  forceVerdict,
   getSession,
   nextTurn,
   resetTrial,
 } from './api/trial';
 import type {
   AgentRole as BackendAgentRole,
+  ObjectionDecision,
   CreateCaseRequest,
   TrialStage as BackendTrialStage,
   TrialState as BackendTrialState,
@@ -97,6 +107,7 @@ function mapStageToPhase(stage?: BackendTrialStage | null): TrialPhase {
 function formatAgent(agent: BackendAgentRole): string {
   if (agent === 'prosecution') return 'PROSECUTION COUNSEL';
   if (agent === 'defense') return 'DEFENSE COUNSEL';
+  if (agent === 'witness') return 'WITNESS TESTIMONY';
   return 'ALGORITHMIC JUDGE UNIT-7';
 }
 
@@ -147,7 +158,7 @@ function toTranscriptDisplay(entries: BackendTranscriptEntry[]): TranscriptDispl
   });
 }
 
-function downloadDebugTranscript(state: BackendTrialState | null) {
+function downloadDebugTranscript(state: BackendTrialState | null, timeline: ApiTimelineEvent[] = []) {
   if (!state) return;
 
   const payload = {
@@ -158,6 +169,7 @@ function downloadDebugTranscript(state: BackendTrialState | null) {
     active_agent: state.active_agent,
     verdict: state.verdict,
     transcript: state.transcript,
+    api_timeline: timeline,
   };
 
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
@@ -224,11 +236,21 @@ function parseError(error: unknown): string {
   return 'Unexpected network error.';
 }
 
-function splitLines(value: string): string[] {
-  return value
+function extractDescriptionField(description: string | undefined, label: string): string | null {
+  if (!description) return null;
+  const prefix = `${label.toLowerCase()}:`;
+  const line = description
     .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
+    .map((item) => item.trim())
+    .find((item) => item.toLowerCase().startsWith(prefix));
+  if (!line) return null;
+  const value = line.slice(prefix.length).trim();
+  return value || null;
+}
+
+function formatStageLabel(stage?: BackendTrialStage | null): string {
+  if (!stage) return 'Proceedings in progress';
+  return stage.replace(/_/g, ' ').toUpperCase();
 }
 
 type VerdictPresentation = {
@@ -237,6 +259,11 @@ type VerdictPresentation = {
   keyFactors: string[];
   confidence: string;
 };
+
+type JudgeRulingState = {
+  decision: ObjectionDecision;
+  reason: string;
+} | null;
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -364,21 +391,67 @@ function buildVerdictTranscript(view: VerdictPresentation): string {
   ].join('\n');
 }
 
+function resolveObjectionDecision(resultText: string, fallback?: ObjectionDecision | null): ObjectionDecision {
+  if (fallback === 'SUSTAINED' || fallback === 'OVERRULED') return fallback;
+  const normalized = resultText.toUpperCase();
+  if (normalized.includes('OVERRULED')) return 'OVERRULED';
+  return 'SUSTAINED';
+}
+
+function downloadApiTimeline(events: ApiTimelineEvent[]): void {
+  if (!events.length) return;
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const blob = new Blob([JSON.stringify({ exported_at: new Date().toISOString(), events }, null, 2)], {
+    type: 'application/json',
+  });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `supreme-api-timeline-${timestamp}.json`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
 export default function App() {
   const [view, setView] = useState<View>('landing');
   const [trialPhase, setTrialPhase] = useState<TrialPhase>('opening');
-  const [isPaused, setIsPaused] = useState(false);
   const [isRedactMode, setIsRedactMode] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [trialState, setTrialState] = useState<BackendTrialState | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [apiError, setApiError] = useState<string | null>(null);
+  const [apiTimelineEvents, setApiTimelineEvents] = useState<ApiTimelineEvent[]>(() => getApiTimelineSnapshot());
+  const [isDebugPanelOpen, setIsDebugPanelOpen] = useState(false);
 
   // ── Judge state (lifted so footer button can trigger it) ────────────────
   const [isObjecting, setIsObjecting] = useState(false);
   const [objectionText, setObjectionText] = useState('');
-  const [judgeRuling, setJudgeRuling] = useState<null | 'SUSTAINED' | 'OVERRULED'>(null);
+  const [judgeRuling, setJudgeRuling] = useState<JudgeRulingState>(null);
   const [judgeStatus, setJudgeStatus] = useState<'LISTENING' | 'EVALUATING' | 'RULING' | 'HALTED'>('LISTENING');
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [isSidebarCompact, setIsSidebarCompact] = useState(false);
+  const [configSidebarState, setConfigSidebarState] = useState<ConfigurationSidebarState | null>(null);
+
+  const handleConfigSidebarStateChange = useCallback((next: ConfigurationSidebarState) => {
+    setConfigSidebarState((prev) => {
+      if (
+        prev
+        && prev.draftStatus === next.draftStatus
+        && prev.completedSteps === next.completedSteps
+        && prev.totalSteps === next.totalSteps
+        && prev.saveState === next.saveState
+        && prev.activeStep === next.activeStep
+        && prev.issueCount === next.issueCount
+        && prev.lastSavedLabel === next.lastSavedLabel
+      ) {
+        return prev;
+      }
+
+      return next;
+    });
+  }, []);
+
+  useEffect(() => subscribeApiTimeline(setApiTimelineEvents), []);
 
   const evidenceRecords = useMemo(() => buildEvidenceFromState(trialState), [trialState]);
   const transcriptEntries = useMemo(
@@ -447,9 +520,13 @@ export default function App() {
     setObjectionText('');
     setIsObjecting(false);
     withSessionAction(async () => {
-      await control(sessionId, { action: 'objection', payload });
+      const response = await control(sessionId, { action: 'objection', payload });
       await syncSession(sessionId);
-      setJudgeRuling('SUSTAINED');
+      const decision = resolveObjectionDecision(response.result, response.objection?.decision);
+      setJudgeRuling({
+        decision,
+        reason: response.objection?.reason || response.result || 'No ruling reason provided by backend.',
+      });
       setJudgeStatus('RULING');
     });
   };
@@ -470,9 +547,20 @@ export default function App() {
     if (!matchText || !matchText.trim()) return;
     setIsRedactMode(true);
     withSessionAction(async () => {
-      await control(sessionId, { action: 'redact', payload: matchText.trim() });
+      try {
+        await control(sessionId, { action: 'redact', payload: matchText.trim() });
+        await syncSession(sessionId);
+      } finally {
+        setTimeout(() => setIsRedactMode(false), 900);
+      }
+    });
+  }, [isLoading, sessionId, syncSession, withSessionAction]);
+
+  const handleVerdict = useCallback(() => {
+    if (!sessionId || isLoading) return;
+    withSessionAction(async () => {
+      await forceVerdict(sessionId);
       await syncSession(sessionId);
-      setTimeout(() => setIsRedactMode(false), 900);
     });
   }, [isLoading, sessionId, syncSession, withSessionAction]);
 
@@ -505,120 +593,183 @@ export default function App() {
   const resumeProceedings = () => { setJudgeRuling(null); setJudgeStatus('LISTENING'); };
 
   const phaseIndex = TRIAL_PHASES.indexOf(trialPhase);
-  const goPrev = () => handleReset();
   const goNext = () => handleNextTurn();
+  const defendantName = useMemo(
+    () => extractDescriptionField(trialState?.case.description, 'Defendant') || 'UNSPECIFIED DEFENDANT',
+    [trialState?.case.description],
+  );
+
+  useEffect(() => {
+    setIsSidebarOpen(false);
+  }, [view]);
+
+  useEffect(() => {
+    if (!isSidebarOpen) {
+      return;
+    }
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setIsSidebarOpen(false);
+      }
+    };
+
+    window.addEventListener('keydown', handleEscape);
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', handleEscape);
+    };
+  }, [isSidebarOpen]);
 
   return (
     <div className="min-h-screen bg-background text-primary selection:bg-primary selection:text-background font-mono uppercase">
-      {/* TopAppBar */}
-      <header className="fixed top-0 w-full z-50 flex items-center px-6 h-16 bg-background border-b border-primary">
+      <button
+        type="button"
+        onClick={() => setIsSidebarOpen(true)}
+        className="fixed top-0 left-0 right-0 z-[70] flex h-14 items-center justify-between border-b border-primary/30 bg-background/95 px-4 md:hidden"
+      >
+        <span className="inline-flex items-center gap-3">
+          <img src="/logo.png" alt="Logo" className="h-8 w-8 object-contain invert" />
+          <span className="text-sm font-bold tracking-[0.2em]">SUPREME</span>
+        </span>
+        <span className="inline-flex items-center gap-2 text-[10px] tracking-[0.15em] text-outline">
+          <Menu className="h-4 w-4" />
+          PANEL
+        </span>
+      </button>
 
-        <div className="flex-1 flex items-center gap-4">
-          <img src="/logo.png" alt="Logo" className="w-14 h-14 object-contain invert" />
-          <h1 className="text-xl font-bold tracking-tighter font-sans">SUPREME</h1>
-        </div>
-
-        <nav className="hidden md:flex flex-none gap-8 items-center h-full">
-          <button
-            onClick={() => setView('landing')}
-            className={cn(
-              "px-2 h-full flex items-center transition-colors duration-100 font-medium",
-              view === 'landing' ? "text-primary border-b-2 border-primary" : "text-outline hover:bg-primary hover:text-background"
-            )}
-          >
-            HOME
-          </button>
-          <button className="text-outline px-2 h-full flex items-center hover:bg-primary hover:text-background transition-colors duration-100">
-            ARCHIVE
-          </button>
-        </nav>
-
-        <div className="flex-1 flex justify-end">
-          <div className="relative flex group">
-            <div className="p-1 cursor-help hover:bg-primary hover:text-background transition-colors">
-              <Shield className="w-5 h-5" />
-            </div>
-            {/* Security Hover Info */}
-            <div className="absolute right-0 top-full mt-2 w-56 bg-background border border-primary p-4 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50 shadow-2xl">
-              <div className="text-[10px] text-outline tracking-[0.2em] mb-2 font-bold">SECURITY INFORMATION</div>
-              <div className="text-[10px] text-primary leading-relaxed font-mono">
-                <span className="text-outline">&gt;</span> End-to-End Encryption: <span className="text-green-500">Active</span><br />
-                <span className="text-outline">&gt;</span> Local Processing: <span className="text-green-500">True</span><br />
-                <span className="text-outline">&gt;</span> Data Logging: <span className="text-outline-variant">None</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      </header>
-
-      {(apiError || isLoading || sessionId) && (
-        <div className="fixed top-16 left-0 right-0 z-40 border-b border-primary/30 bg-background/95 backdrop-blur px-6 py-2 text-[10px] tracking-widest flex items-center justify-between gap-4">
-          <div className="truncate">
-            {apiError ? (
-              <span className="text-red-400">API ERROR: {apiError}</span>
-            ) : (
-              <span className="text-outline">{isLoading ? 'SYNCING SESSION...' : 'SESSION CONNECTED'}</span>
-            )}
-          </div>
-          {sessionId && <span className="text-outline">SESSION: {sessionId.slice(0, 8)}...</span>}
-        </div>
-      )}
-
-      <AnimatePresence mode="wait">
-        {view === 'landing' && (
-          <motion.div key="landing" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="w-full">
-            <LandingView onStart={() => setView('config')} />
-          </motion.div>
+      <aside
+        className={cn(
+          'fixed inset-y-0 left-0 z-[65] hidden border-r border-primary bg-background transition-[width] duration-200 md:block',
+          isSidebarCompact ? 'w-20' : 'w-72',
         )}
-        {view === 'config' && (
-          <motion.div key="config" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -20 }} className="w-full">
-            <ConfigView onStart={handleCreateCase} isLoading={isLoading} />
-          </motion.div>
-        )}
-        {view === 'simulation' && (
-          <motion.div key="simulation" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="w-full">
-            <SimulationView
-              trialState={trialState}
-              trialPhase={trialPhase}
-              isRedactMode={isRedactMode}
-              isPaused={isPaused}
-              isLoading={isLoading}
-              onViewEvidence={() => setView('evidence')}
-              onViewTranscript={() => setView('transcript')}
-              onFastForward={handleFastForward}
-              isObjecting={isObjecting}
-              setIsObjecting={setIsObjecting}
-              objectionText={objectionText}
-              setObjectionText={setObjectionText}
-              judgeRuling={judgeRuling}
-              judgeStatus={judgeStatus}
-              setJudgeStatus={setJudgeStatus}
-              submitObjection={submitObjection}
-              resumeProceedings={resumeProceedings}
+      >
+        <AppSidebar
+          view={view}
+          onNavigate={setView}
+          isCompact={isSidebarCompact}
+          onToggleCompact={() => setIsSidebarCompact((prev) => !prev)}
+          sessionId={sessionId}
+          isLoading={isLoading}
+          apiError={apiError}
+          trialState={trialState}
+          trialPhase={trialPhase}
+          judgeStatus={judgeStatus}
+          evidenceCount={evidenceRecords.length}
+          transcriptCount={transcriptEntries.length}
+          defendantName={defendantName}
+          configState={configSidebarState}
+        />
+      </aside>
+
+      <AnimatePresence>
+        {isSidebarOpen && (
+          <>
+            <motion.button
+              type="button"
+              onClick={() => setIsSidebarOpen(false)}
+              className="fixed inset-0 z-[82] bg-black/70 md:hidden"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
             />
-          </motion.div>
-        )}
-        {view === 'evidence' && (
-          <motion.div key="evidence" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="w-full">
-            <EvidenceView
-              onBack={() => setView('simulation')}
-              onViewTranscript={() => setView('transcript')}
-              records={evidenceRecords}
-            />
-          </motion.div>
-        )}
-        {view === 'transcript' && (
-          <motion.div key="transcript" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="w-full">
-            <TranscriptView
-              onBack={() => setView('simulation')}
-              onViewEvidence={() => setView('evidence')}
-              entries={transcriptEntries}
-              caseId={trialState?.case.case_id}
-              trialState={trialState}
-            />
-          </motion.div>
+            <motion.aside
+              className="fixed inset-y-0 left-0 z-[85] w-[min(88vw,320px)] border-r border-primary bg-background md:hidden"
+              initial={{ x: -360 }}
+              animate={{ x: 0 }}
+              exit={{ x: -360 }}
+            >
+              <AppSidebar
+                view={view}
+                onNavigate={(nextView) => {
+                  setView(nextView);
+                  setIsSidebarOpen(false);
+                }}
+                onCloseMobile={() => setIsSidebarOpen(false)}
+                sessionId={sessionId}
+                isLoading={isLoading}
+                apiError={apiError}
+                trialState={trialState}
+                trialPhase={trialPhase}
+                judgeStatus={judgeStatus}
+                evidenceCount={evidenceRecords.length}
+                transcriptCount={transcriptEntries.length}
+                defendantName={defendantName}
+                configState={configSidebarState}
+              />
+            </motion.aside>
+          </>
         )}
       </AnimatePresence>
+
+      <div className={cn('md:pl-72 transition-[padding] duration-200', isSidebarCompact && 'md:pl-20')}>
+        <div className="pt-14 md:pt-0">
+          <AnimatePresence mode="wait">
+            {view === 'landing' && (
+              <motion.div key="landing" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="w-full">
+                <LandingView onStart={() => setView('config')} />
+              </motion.div>
+            )}
+            {view === 'config' && (
+              <motion.div key="config" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -20 }} className="w-full">
+                <ConfigurationView
+                  onStart={handleCreateCase}
+                  isLoading={isLoading}
+                  isSidebarCompact={isSidebarCompact}
+                  onSidebarStateChange={handleConfigSidebarStateChange}
+                />
+              </motion.div>
+            )}
+            {view === 'simulation' && (
+              <motion.div key="simulation" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="w-full">
+                <SimulationView
+                  trialState={trialState}
+                  trialPhase={trialPhase}
+                  isSidebarCompact={isSidebarCompact}
+                  isRedactMode={isRedactMode}
+                  isLoading={isLoading}
+                  onViewEvidence={() => setView('evidence')}
+                  onViewTranscript={() => setView('transcript')}
+                  onFastForward={handleFastForward}
+                  isObjecting={isObjecting}
+                  setIsObjecting={setIsObjecting}
+                  objectionText={objectionText}
+                  setObjectionText={setObjectionText}
+                  judgeRuling={judgeRuling}
+                  judgeStatus={judgeStatus}
+                  setJudgeStatus={setJudgeStatus}
+                  submitObjection={submitObjection}
+                  resumeProceedings={resumeProceedings}
+                />
+              </motion.div>
+            )}
+            {view === 'evidence' && (
+              <motion.div key="evidence" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="w-full">
+                <EvidenceView
+                  onBack={() => setView('simulation')}
+                  onViewTranscript={() => setView('transcript')}
+                  records={evidenceRecords}
+                />
+              </motion.div>
+            )}
+            {view === 'transcript' && (
+              <motion.div key="transcript" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="w-full">
+                <TranscriptView
+                  onBack={() => setView('simulation')}
+                  onViewEvidence={() => setView('evidence')}
+                  entries={transcriptEntries}
+                  caseId={trialState?.case.case_id}
+                  trialState={trialState}
+                />
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+      </div>
 
       {/* Bottom Controls — simulation only, slides up on mount */}
       <AnimatePresence>
@@ -629,7 +780,10 @@ export default function App() {
             animate={{ y: 0 }}
             exit={{ y: 100 }}
             transition={{ type: 'spring', stiffness: 300, damping: 30 }}
-            className="fixed bottom-0 left-0 w-full z-50 flex justify-around items-center h-20 px-8 bg-background/90 backdrop-blur-xl border-t border-primary"
+            className={cn(
+              'fixed bottom-0 left-0 right-0 z-50 flex justify-around items-center h-20 px-8 bg-background/90 backdrop-blur-xl border-t border-primary transition-[left] duration-200',
+              isSidebarCompact ? 'md:left-20' : 'md:left-72',
+            )}
           >
             <ControlBtn
               icon={<Mic className="w-5 h-5" />}
@@ -639,8 +793,8 @@ export default function App() {
             />
             <ControlBtn
               icon={<StepBack className="w-5 h-5" />}
-              label="RESET"
-              onClick={goPrev}
+              label="RESET TRIAL"
+              onClick={handleReset}
               disabled={!sessionId || isLoading}
             />
             <ControlBtn
@@ -659,8 +813,8 @@ export default function App() {
             />
             <ControlBtn
               icon={<Pause className="w-5 h-5" />}
-              label="VERDICT"
-              onClick={handleFastForward}
+              label="FORCE VERDICT"
+              onClick={handleVerdict}
               disabled={!sessionId || isLoading}
             />
             <ControlBtn
@@ -673,6 +827,225 @@ export default function App() {
           </motion.footer>
         )}
       </AnimatePresence>
+
+      {view === 'simulation' && (
+        <DebugOverflowPanel
+          isOpen={isDebugPanelOpen}
+          events={apiTimelineEvents}
+          onToggle={() => setIsDebugPanelOpen((prev) => !prev)}
+          onClear={clearApiTimeline}
+          onExport={() => downloadApiTimeline(apiTimelineEvents)}
+        />
+      )}
+    </div>
+  );
+}
+
+type AppSidebarProps = {
+  view: View;
+  onNavigate: (view: View) => void;
+  isCompact?: boolean;
+  onToggleCompact?: () => void;
+  onCloseMobile?: () => void;
+  sessionId: string | null;
+  isLoading: boolean;
+  apiError: string | null;
+  trialState: BackendTrialState | null;
+  trialPhase: TrialPhase;
+  judgeStatus: 'LISTENING' | 'EVALUATING' | 'RULING' | 'HALTED';
+  evidenceCount: number;
+  transcriptCount: number;
+  defendantName: string;
+  configState: ConfigurationSidebarState | null;
+};
+
+function sidebarItemClass(active: boolean): string {
+  return cn(
+    'flex w-full items-center justify-start gap-3 border px-3 py-2 text-[10px] tracking-[0.18em] transition-colors',
+    active
+      ? 'border-primary bg-primary text-background'
+      : 'border-outline/30 text-outline hover:border-primary hover:text-primary',
+  );
+}
+
+function AppSidebar({
+  view,
+  onNavigate,
+  isCompact = false,
+  onToggleCompact,
+  onCloseMobile,
+  sessionId,
+  isLoading,
+  apiError,
+  trialState,
+  trialPhase,
+  judgeStatus,
+  evidenceCount,
+  transcriptCount,
+  defendantName,
+  configState,
+}: AppSidebarProps) {
+  const navItems: Array<{ id: View; label: string; icon: React.ReactNode }> = [
+    { id: 'landing', label: 'HOME', icon: <Gavel className="h-4 w-4" /> },
+    { id: 'config', label: 'CONFIGURATION', icon: <BookOpen className="h-4 w-4" /> },
+    { id: 'simulation', label: 'DOCKET', icon: <Terminal className="h-4 w-4" /> },
+    { id: 'evidence', label: 'EVIDENCE', icon: <FolderOpen className="h-4 w-4" /> },
+    { id: 'transcript', label: 'TRANSCRIPT', icon: <FileText className="h-4 w-4" /> },
+  ];
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className={cn('border-b border-primary', isCompact ? 'px-3 py-4' : 'px-5 py-5')}>
+        <div className={cn('flex items-center', isCompact ? 'justify-center' : 'gap-3')}>
+          <img src="/logo.png" alt="Logo" className="h-10 w-10 object-contain invert" />
+          {!isCompact && (
+            <div>
+              <h1 className="font-sans text-lg font-bold tracking-[0.15em]">SUPREME</h1>
+              <p className="text-[9px] tracking-[0.2em] text-outline">COURT MANAGEMENT</p>
+            </div>
+          )}
+        </div>
+        <div className={cn('mt-3 flex', isCompact ? 'justify-center' : 'items-center justify-between')}>
+          {onToggleCompact && (
+            <button
+              type="button"
+              onClick={onToggleCompact}
+              className={cn(
+                'inline-flex items-center gap-2 border border-outline/40 px-2 py-1 text-[9px] tracking-[0.15em] text-outline hover:border-primary hover:text-primary',
+                isCompact && 'h-8 w-8 justify-center px-0',
+              )}
+              title={isCompact ? 'Expand sidebar' : 'Compact sidebar'}
+              aria-label={isCompact ? 'Expand sidebar' : 'Compact sidebar'}
+            >
+              {isCompact ? <PanelLeftOpen className="h-3.5 w-3.5" /> : <PanelLeftClose className="h-3.5 w-3.5" />}
+              {!isCompact && <span>{isCompact ? 'EXPAND' : 'COMPACT'}</span>}
+            </button>
+          )}
+          {onCloseMobile && !isCompact && (
+            <button
+              type="button"
+              onClick={onCloseMobile}
+              className="inline-flex h-8 w-8 items-center justify-center border border-outline/40 text-outline hover:border-primary hover:text-primary md:hidden"
+              aria-label="Close sidebar"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className={cn('border-b border-primary/30', isCompact ? 'px-3 py-3' : 'px-5 py-4')}>
+        {!isCompact && <p className="mb-2 text-[9px] tracking-[0.25em] text-outline">SESSION STATUS</p>}
+        {apiError ? (
+          <p className={cn('text-[10px] tracking-[0.15em] text-red-400', isCompact && 'text-center')}>{isCompact ? 'ERR' : `API ERROR: ${apiError}`}</p>
+        ) : (
+          <p className={cn('text-[10px] tracking-[0.15em] text-outline', isCompact && 'text-center')}>
+            {isCompact ? (isLoading ? 'SYNC' : 'LIVE') : (isLoading ? 'SYNCING SESSION...' : 'SESSION CONNECTED')}
+          </p>
+        )}
+        {!isCompact && <p className="mt-1 break-all text-[10px] tracking-[0.1em] text-outline">SID: {sessionId || 'N/A'}</p>}
+      </div>
+
+      <nav className={cn('space-y-2 border-b border-primary/30', isCompact ? 'px-2 py-3' : 'px-5 py-4')}>
+        {navItems.map((item) => (
+          <button
+            key={item.id}
+            onClick={() => onNavigate(item.id)}
+            className={cn(sidebarItemClass(view === item.id), isCompact && 'h-10 justify-center px-2')}
+            title={item.label}
+          >
+            {item.icon}
+            {!isCompact && <span>{item.label}</span>}
+          </button>
+        ))}
+      </nav>
+
+      <div className={cn('flex-1 space-y-4 overflow-y-auto', isCompact ? 'px-2 py-3' : 'px-5 py-4')}>
+        {isCompact ? (
+          <div className="space-y-2">
+            <div className="border border-primary/20 bg-surface-container-low px-2 py-2 text-center text-[9px] tracking-[0.12em] text-outline">
+              SECURE
+            </div>
+            {view === 'config' && configState && (
+              <div className="border border-primary/20 bg-surface-container-low px-2 py-2 text-center text-[9px] tracking-[0.12em] text-outline">
+                CFG {configState.completedSteps}/{configState.totalSteps}
+              </div>
+            )}
+            {view === 'simulation' && (
+              <div className="border border-primary/20 bg-surface-container-low px-2 py-2 text-center text-[9px] tracking-[0.12em] text-outline">
+                {judgeStatus}
+              </div>
+            )}
+            {view === 'evidence' && (
+              <div className="border border-primary/20 bg-surface-container-low px-2 py-2 text-center text-[9px] tracking-[0.12em] text-outline">
+                EVD {evidenceCount}
+              </div>
+            )}
+            {view === 'transcript' && (
+              <div className="border border-primary/20 bg-surface-container-low px-2 py-2 text-center text-[9px] tracking-[0.12em] text-outline">
+                TXT {transcriptCount}
+              </div>
+            )}
+          </div>
+        ) : (
+          <>
+        <div className="border border-primary/20 bg-surface-container-low px-3 py-3">
+          <p className="text-[9px] tracking-[0.2em] text-outline">COURT SECURITY</p>
+          <p className="mt-2 text-[10px] tracking-[0.1em] text-primary">END-TO-END ENCRYPTION: ACTIVE</p>
+          <p className="mt-1 text-[10px] tracking-[0.1em] text-primary">LOCAL PROCESSING: TRUE</p>
+          <p className="mt-1 text-[10px] tracking-[0.1em] text-outline">DATA LOGGING: NONE</p>
+        </div>
+
+        {view === 'config' && configState && (
+          <div className="border border-primary/20 bg-surface-container-low px-3 py-3">
+            <p className="text-[9px] tracking-[0.2em] text-outline">CONFIGURATION LIVE</p>
+            <p className="mt-2 text-[10px] tracking-[0.12em] text-primary">
+              STATUS: {configState.draftStatus.toUpperCase()}
+            </p>
+            <p className="mt-1 text-[10px] tracking-[0.12em] text-outline">
+              STEPS: {configState.completedSteps}/{configState.totalSteps}
+            </p>
+            <p className="mt-1 text-[10px] tracking-[0.12em] text-outline">
+              ACTIVE: {configState.activeStep.toUpperCase()}
+            </p>
+            <p className="mt-1 text-[10px] tracking-[0.12em] text-outline">
+              SAVE: {configState.saveState.toUpperCase()}
+            </p>
+            <p className="mt-1 text-[10px] tracking-[0.12em] text-outline">ISSUES: {configState.issueCount}</p>
+            <p className="mt-1 text-[10px] tracking-[0.1em] text-outline normal-case">
+              Last saved: {configState.lastSavedLabel}
+            </p>
+          </div>
+        )}
+
+        {view === 'simulation' && (
+          <div className="border border-primary/20 bg-surface-container-low px-3 py-3">
+            <p className="text-[9px] tracking-[0.2em] text-outline">TRIAL LIVE</p>
+            <p className="mt-2 text-[10px] tracking-[0.12em] text-primary">PHASE: {trialPhase.replace('_', ' ')}</p>
+            <p className="mt-1 text-[10px] tracking-[0.12em] text-outline">JUDGE: {judgeStatus}</p>
+            <p className="mt-1 text-[10px] tracking-[0.12em] text-outline">ACTIVE AGENT: {trialState?.active_agent || 'N/A'}</p>
+            <p className="mt-1 text-[10px] tracking-[0.12em] text-outline">DEFENDANT: {defendantName}</p>
+          </div>
+        )}
+
+        {view === 'evidence' && (
+          <div className="border border-primary/20 bg-surface-container-low px-3 py-3">
+            <p className="text-[9px] tracking-[0.2em] text-outline">EVIDENCE LIVE</p>
+            <p className="mt-2 text-[10px] tracking-[0.12em] text-primary">TOTAL RECORDS: {evidenceCount}</p>
+            <p className="mt-1 text-[10px] tracking-[0.12em] text-outline">SESSION: {sessionId ? 'ACTIVE' : 'NO SESSION'}</p>
+          </div>
+        )}
+
+        {view === 'transcript' && (
+          <div className="border border-primary/20 bg-surface-container-low px-3 py-3">
+            <p className="text-[9px] tracking-[0.2em] text-outline">TRANSCRIPT LIVE</p>
+            <p className="mt-2 text-[10px] tracking-[0.12em] text-primary">ENTRIES: {transcriptCount}</p>
+            <p className="mt-1 text-[10px] tracking-[0.12em] text-outline">STAGE: {formatStageLabel(trialState?.stage)}</p>
+          </div>
+        )}
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -698,6 +1071,71 @@ function ControlBtn({
       {icon}
       <span className="text-[10px] font-bold mt-1 tracking-widest">{label}</span>
     </button>
+  );
+}
+
+function DebugOverflowPanel({
+  isOpen,
+  events,
+  onToggle,
+  onClear,
+  onExport,
+}: {
+  isOpen: boolean;
+  events: ApiTimelineEvent[];
+  onToggle: () => void;
+  onClear: () => void;
+  onExport: () => void;
+}) {
+  const recent = useMemo(() => [...events].slice(-20).reverse(), [events]);
+
+  return (
+    <>
+      <button
+        onClick={onToggle}
+        className="fixed bottom-24 right-4 z-[60] border border-primary/40 bg-background/95 px-3 py-2 text-[9px] tracking-[0.2em] hover:border-primary hover:text-primary transition-colors"
+      >
+        DEBUG {isOpen ? 'OFF' : 'ON'} ({events.length})
+      </button>
+
+      {isOpen && (
+        <div className="fixed bottom-36 right-4 z-[60] w-[min(92vw,560px)] h-[300px] border border-primary/30 bg-background/95 backdrop-blur overflow-hidden flex flex-col">
+          <div className="flex items-center justify-between px-3 py-2 border-b border-primary/20">
+            <div className="text-[9px] tracking-[0.2em] text-outline">API EVENT OVERFLOW</div>
+            <div className="flex items-center gap-2">
+              <button onClick={onExport} className="p-1.5 hover:text-primary transition-colors" title="Export events">
+                <Download className="w-3.5 h-3.5" />
+              </button>
+              <button onClick={onClear} className="p-1.5 hover:text-primary transition-colors" title="Clear events">
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+              <button onClick={onToggle} className="p-1.5 hover:text-primary transition-colors" title="Close panel">
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+
+          <div className="flex-1 overflow-y-auto text-[10px]">
+            {!recent.length && <div className="px-3 py-4 text-outline">No API events captured yet.</div>}
+            {recent.map((event) => (
+              <div key={event.id} className="px-3 py-2 border-b border-primary/10 font-mono normal-case">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-outline">{event.event}</span>
+                  <span className="text-outline">{event.method} {event.path}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3 mt-1 text-outline/80">
+                  <span>{new Date(event.at).toLocaleTimeString('en-GB')}</span>
+                  <span>
+                    {typeof event.status === 'number' ? `status ${event.status}` : 'pending'}
+                    {typeof event.latencyMs === 'number' ? ` - ${event.latencyMs}ms` : ''}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -749,30 +1187,9 @@ function EvidenceView({
   );
 
   return (
-    <main className="flex min-h-screen pt-16 bg-background">
-      {/* Sidebar */}
-      <aside className="hidden md:flex flex-none w-64 flex-col bg-background border-r border-primary fixed top-16 bottom-0 left-0">
-        <div className="p-6 border-b border-primary">
-          <h2 className="text-lg font-bold font-sans">Court Management</h2>
-          <p className="text-[10px] text-outline uppercase">Status: Secure</p>
-        </div>
-        <nav className="flex-grow">
-          <SideLink icon={<Gavel className="w-4 h-4" />} label="DOCKET" onClick={onBack} />
-          <SideLink icon={<FolderOpen className="w-4 h-4" />} label="EVIDENCE" active />
-          <SideLink icon={<FileText className="w-4 h-4" />} label="TRANSCRIPT" onClick={onViewTranscript} />
-          <SideLink icon={<BookOpen className="w-4 h-4" />} label="STATUTES" onClick={onBack} />
-        </nav>
-        <div className="p-6 border-t border-primary mt-auto">
-          <div className="space-y-1">
-            <div className="flex items-center gap-2 text-[10px] text-outline"><span className="w-2 h-2 bg-white inline-block" /> Prosecution</div>
-            <div className="flex items-center gap-2 text-[10px] text-outline"><span className="w-2 h-2 bg-[#6b7280] inline-block" /> Defense</div>
-            <div className="flex items-center gap-2 text-[10px] text-outline"><span className="w-2 h-2 bg-[#d4af37] inline-block" /> Court</div>
-          </div>
-        </div>
-      </aside>
-
+    <main className="flex min-h-screen bg-background">
       {/* Main Content */}
-      <div className="flex-1 md:ml-64 flex flex-col min-h-0">
+      <div className="flex-1 flex flex-col min-h-0">
         {/* Page Header */}
         <div className="px-10 py-8 border-b border-primary flex flex-col md:flex-row md:items-end justify-between gap-4">
           <div>
@@ -780,6 +1197,18 @@ function EvidenceView({
             <p className="text-[10px] text-outline tracking-widest uppercase">{filtered.length} of {records.length} Records — Current Session</p>
           </div>
           <div className="flex items-center gap-3 flex-wrap">
+            <button
+              onClick={onBack}
+              className="text-[10px] tracking-widest px-3 py-1 border border-primary/40 text-outline hover:border-primary hover:text-primary"
+            >
+              DOCKET
+            </button>
+            <button
+              onClick={onViewTranscript}
+              className="text-[10px] tracking-widest px-3 py-1 border border-primary/40 text-outline hover:border-primary hover:text-primary"
+            >
+              TRANSCRIPT
+            </button>
             <Scale className="w-4 h-4 text-outline" />
             <span className="text-[10px] text-outline tracking-widest uppercase">Filter by Party:</span>
             {(['all', 'prosecution', 'defense', 'court'] as const).map(p => (
@@ -880,7 +1309,7 @@ function EvidenceView({
 function LandingView({ onStart }: { onStart: () => void }) {
 
   return (
-    <main className="min-h-screen flex flex-col items-center justify-center pt-16 relative overflow-hidden">
+    <main className="min-h-screen flex flex-col items-center justify-center relative overflow-hidden">
       <div className="absolute -inset-x-[14%] -inset-y-[10%] opacity-95 pointer-events-none">
         <Beams
           beamWidth={4.2}
@@ -938,374 +1367,11 @@ function InfoBlock({ title, content }: { title: string, content: string }) {
   );
 }
 
-function ConfigView({
-  onStart,
-  isLoading,
-}: {
-  onStart: (payload: CreateCaseRequest) => void;
-  isLoading: boolean;
-}) {
-  const [activeTab, setActiveTab] = useState<'prosecution' | 'defense'>('prosecution');
-  const [caseType, setCaseType] = useState<'CRIMINAL' | 'CIVIL' | 'CORPORATE'>('CRIMINAL');
-  const [difficulty, setDifficulty] = useState<'easy' | 'medium' | 'hard'>('medium');
-  const [defendantName, setDefendantName] = useState('');
-  const [chargesText, setChargesText] = useState('');
-  const [prosecutionNarrative, setProsecutionNarrative] = useState('');
-  const [prosecutionEvidenceText, setProsecutionEvidenceText] = useState('');
-  const [defenseNarrative, setDefenseNarrative] = useState('');
-  const [witnessListText, setWitnessListText] = useState('');
-  const [defenseEvidenceText, setDefenseEvidenceText] = useState('');
-
-  const submitCase = () => {
-    const charges = splitLines(chargesText);
-    const prosecutionEvidence = splitLines(prosecutionEvidenceText);
-    const defenseEvidence = splitLines(defenseEvidenceText);
-    const title = `${caseType} - ${defendantName.trim() || 'Unnamed Defendant'}`;
-    const descriptionParts = [
-      `Case Type: ${caseType}`,
-      defendantName.trim() ? `Defendant: ${defendantName.trim()}` : '',
-      prosecutionNarrative.trim() ? `Prosecution: ${prosecutionNarrative.trim()}` : '',
-      defenseNarrative.trim() ? `Defense: ${defenseNarrative.trim()}` : '',
-      witnessListText.trim() ? `Witnesses: ${witnessListText.trim()}` : '',
-    ].filter(Boolean);
-
-    onStart({
-      title,
-      description: descriptionParts.join('\n\n'),
-      charges: charges.length ? charges : [`${caseType} charge under active review`],
-      evidence: [...prosecutionEvidence, ...defenseEvidence],
-      difficulty,
-    });
-  };
-
-  return (
-    <main className="md:ml-64 pt-16 min-h-screen pb-24 relative">
-      <div className="absolute inset-0 dossier-grid opacity-10 pointer-events-none" />
-
-      {/* SideNavBar */}
-      <aside className="fixed left-0 top-16 h-[calc(100vh-64px)] w-64 flex flex-col bg-background border-r border-primary hidden md:flex">
-        <div className="p-6 border-b border-primary">
-          <div className="text-lg font-bold font-sans">Court Management</div>
-          <div className="text-[10px] text-outline mt-1 tracking-widest uppercase">Status: Secure</div>
-        </div>
-        <nav className="flex-1 py-4">
-          <SideLink icon={<Gavel className="w-4 h-4" />} label="DOCKET" active />
-          <SideLink icon={<FolderOpen className="w-4 h-4" />} label="EVIDENCE" />
-          <SideLink icon={<FileText className="w-4 h-4" />} label="TRANSCRIPT" />
-          <SideLink icon={<BookOpen className="w-4 h-4" />} label="STATUTES" />
-        </nav>
-        <div className="p-6 mt-auto border-t border-primary/20">
-          <div className="text-[10px] text-outline mb-2 uppercase">Session ID</div>
-          <div className="text-[10px] break-all opacity-50 font-mono">0x4F92...B331</div>
-        </div>
-      </aside>
-
-      <div className="max-w-4xl mx-auto px-6 py-12 relative z-10">
-        <div className="mb-12 flex flex-col md:flex-row md:items-end justify-between border-b border-primary pb-8 gap-4">
-          <div>
-            <h1 className="text-5xl font-extrabold font-sans tracking-tighter mb-2">CONFIGURATION</h1>
-            <p className="text-outline text-xs tracking-[0.3em] font-medium uppercase">CREATE NEW CASE PROFILE</p>
-          </div>
-          <div className="text-right">
-            <span className="text-xs px-3 py-1 border border-primary bg-primary/10 tracking-widest uppercase">CASE</span>
-          </div>
-        </div>
-
-        {/* ── Terminal Tabs ─────────────────────────────────────────────── */}
-        <div className="flex items-stretch border border-primary mb-10">
-          {(['prosecution', 'defense'] as const).map(tab => (
-            <button
-              key={tab}
-              onClick={() => setActiveTab(tab)}
-              className={cn(
-                "flex-1 py-3 px-6 text-xs font-bold tracking-[0.25em] uppercase transition-all duration-150 font-mono flex items-center justify-center gap-3",
-                activeTab === tab
-                  ? "bg-primary text-background"
-                  : "text-outline hover:text-primary hover:bg-primary/5"
-              )}
-            >
-              {tab === 'prosecution' ? 'PROSECUTION DATA' : 'DEFENSE DATA'}
-            </button>
-          ))}
-        </div>
-
-        {/* ── Prosecution Fields ────────────────────────────────────────── */}
-        {activeTab === 'prosecution' && (
-          <div className="space-y-12">
-            {/* Case Type + Parties */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-12">
-              <div className="space-y-2">
-                <label className="block text-[10px] tracking-widest text-outline">CASE TYPE</label>
-                <div className="relative">
-                  <select
-                    value={caseType}
-                    onChange={(event) => setCaseType(event.target.value as 'CRIMINAL' | 'CIVIL' | 'CORPORATE')}
-                    className="w-full bg-transparent border-0 border-b border-primary text-primary font-bold tracking-widest py-3 focus:ring-0 appearance-none cursor-pointer"
-                  >
-                    <option className="bg-background">CRIMINAL</option>
-                    <option className="bg-background">CIVIL</option>
-                    <option className="bg-background">CORPORATE</option>
-                  </select>
-                  <ChevronDown className="absolute right-0 top-3 w-5 h-5 pointer-events-none" />
-                </div>
-              </div>
-              <div className="space-y-2 overflow-hidden">
-                <label className="block text-[10px] tracking-widest text-outline">DEFENDANT NAME</label>
-                <input
-                  className="w-full bg-transparent border-0 border-b border-primary text-primary font-bold tracking-widest py-3 focus:ring-0 focus:outline-none focus:border-b-2 placeholder:text-surface-container-highest"
-                  placeholder="FULL LEGAL NAME OF DEFENDANT"
-                  type="text"
-                  value={defendantName}
-                  onChange={(event) => setDefendantName(event.target.value)}
-                />
-              </div>
-            </div>
-
-            <Field
-              label="THE CHARGES / ALLEGATIONS"
-              placeholder="STATE ONE CHARGE PER LINE"
-              rows={3}
-              value={chargesText}
-              onChange={setChargesText}
-            />
-            <Field
-              label="PROSECUTION NARRATIVE"
-              placeholder="THE SEQUENCE OF EVENTS ACCORDING TO THE ACCUSER / PLAINTIFF..."
-              rows={4}
-              value={prosecutionNarrative}
-              onChange={setProsecutionNarrative}
-            />
-
-            {/* Prosecution Evidence */}
-            <div className="space-y-6">
-              <div className="flex items-center justify-between">
-                <label className="block text-[10px] tracking-widest text-outline">PROSECUTION EVIDENCE</label>
-                <span className="text-[10px] text-outline">MAX_FILE_SIZE: 50MB</span>
-              </div>
-              <div className="border border-primary border-dashed p-12 text-center group cursor-pointer hover:bg-primary/5 transition-colors">
-                <Upload className="w-10 h-10 mx-auto mb-4 text-outline group-hover:text-primary transition-colors" />
-                <p className="text-xs tracking-widest text-outline group-hover:text-primary">PASTE ONE EVIDENCE ITEM PER LINE</p>
-                <textarea
-                  className="mt-4 w-full bg-transparent border border-primary/40 p-3 text-[10px] tracking-widest text-primary normal-case min-h-[110px] focus:outline-none"
-                  placeholder="Example: CCTV footage from west gate"
-                  value={prosecutionEvidenceText}
-                  onChange={(event) => setProsecutionEvidenceText(event.target.value)}
-                />
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* ── Defense Fields ────────────────────────────────────────────── */}
-        {activeTab === 'defense' && (
-          <div className="space-y-12">
-            {/* Plea / Stance */}
-            <div className="space-y-2">
-              <label className="block text-[10px] tracking-widest text-outline">THE PLEA / STANCE</label>
-              <div className="relative">
-                <select className="w-full bg-transparent border-0 border-b border-primary text-primary font-bold tracking-widest py-3 focus:ring-0 appearance-none cursor-pointer">
-                  <option className="bg-background">NOT GUILTY</option>
-                  <option className="bg-background">SELF-DEFENSE</option>
-                  <option className="bg-background">LACK OF EVIDENCE</option>
-                  <option className="bg-background">ALIBI</option>
-                  <option className="bg-background">PROCEDURAL VIOLATION</option>
-                  <option className="bg-background">NO CONTEST</option>
-                </select>
-                <ChevronDown className="absolute right-0 top-3 w-5 h-5 pointer-events-none" />
-              </div>
-            </div>
-
-            <Field
-              label="DEFENSE COUNTER-NARRATIVE"
-              placeholder="THE ALTERNATE SEQUENCE OF EVENTS AS STATED BY THE DEFENDANT..."
-              rows={4}
-              value={defenseNarrative}
-              onChange={setDefenseNarrative}
-            />
-            <Field
-              label="WITNESS / ALIBI LIST"
-              placeholder="LIST WITNESSES AND ALIBI DETAILS, ONE PER LINE..."
-              rows={3}
-              value={witnessListText}
-              onChange={setWitnessListText}
-            />
-
-            {/* Defense Evidence */}
-            <div className="space-y-6">
-              <div className="flex items-center justify-between">
-                <label className="block text-[10px] tracking-widest text-outline">DEFENSE EVIDENCE</label>
-                <span className="text-[10px] text-outline">MAX_FILE_SIZE: 50MB</span>
-              </div>
-              <div className="border border-primary border-dashed p-12 text-center group cursor-pointer hover:bg-primary/5 transition-colors">
-                <Upload className="w-10 h-10 mx-auto mb-4 text-outline group-hover:text-primary transition-colors" />
-                <p className="text-xs tracking-widest text-outline group-hover:text-primary">PASTE ONE EVIDENCE ITEM PER LINE</p>
-                <textarea
-                  className="mt-4 w-full bg-transparent border border-primary/40 p-3 text-[10px] tracking-widest text-primary normal-case min-h-[110px] focus:outline-none"
-                  placeholder="Example: Hospital admission records"
-                  value={defenseEvidenceText}
-                  onChange={(event) => setDefenseEvidenceText(event.target.value)}
-                />
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* ── Global: Start Simulation ──────────────────────────────────── */}
-        <div className="pt-12">
-          <div className="mb-6 grid grid-cols-1 md:grid-cols-2 gap-6">
-            <div className="space-y-2">
-              <label className="block text-[10px] tracking-widest text-outline">TRIAL DIFFICULTY</label>
-              <select
-                value={difficulty}
-                onChange={(event) => setDifficulty(event.target.value as 'easy' | 'medium' | 'hard')}
-                className="w-full bg-transparent border border-primary/30 px-3 py-3 text-xs tracking-widest"
-              >
-                <option value="easy" className="bg-background">EASY</option>
-                <option value="medium" className="bg-background">MEDIUM</option>
-                <option value="hard" className="bg-background">HARD</option>
-              </select>
-            </div>
-          </div>
-          <button
-            onClick={submitCase}
-            disabled={isLoading}
-            className="w-full py-6 border border-primary text-primary hover:bg-primary hover:text-background font-bold tracking-[0.5em] transition-all duration-300 text-xl flex items-center justify-center gap-4 group disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            {isLoading ? 'STARTING...' : 'START SIMULATION'}
-            <ArrowRight className="w-6 h-6 group-hover:translate-x-2 transition-transform" />
-          </button>
-          <div className="mt-4 flex justify-between items-center px-2">
-            <div className="flex items-center gap-2">
-              <span className="w-2 h-2 bg-green-500" />
-              <span className="text-[9px] text-outline tracking-widest uppercase">All systems operational</span>
-            </div>
-            <span className="text-[9px] text-outline tracking-widest uppercase">Version: 1.0.0</span>
-          </div>
-        </div>
-      </div>
-    </main>
-  );
-}
-
-function SideLink({ icon, label, active, onClick }: { icon: React.ReactNode, label: string, active?: boolean, onClick?: () => void }) {
-  return (
-    <a className={cn(
-      "flex items-center px-6 py-4 gap-4 transition-colors duration-100 font-bold text-xs tracking-widest cursor-pointer",
-      active ? "bg-primary text-background" : "text-outline hover:text-primary hover:bg-surface-container"
-    )} onClick={(e) => { e.preventDefault(); onClick?.(); }} href="#">
-      {icon}
-      {label}
-    </a>
-  );
-}
-
-function Field({
-  label,
-  placeholder,
-  rows,
-  value,
-  onChange,
-}: {
-  label: string;
-  placeholder: string;
-  rows: number;
-  value: string;
-  onChange: (nextValue: string) => void;
-}) {
-  return (
-    <div className="space-y-2">
-      <label className="block text-[10px] tracking-widest text-outline">{label}</label>
-      <textarea
-        className="w-full bg-transparent border-0 border-b border-primary text-primary font-medium tracking-widest py-3 focus:ring-0 focus:border-b-2 placeholder:text-surface-container-highest resize-none"
-        placeholder={placeholder}
-        rows={rows}
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-      />
-    </div>
-  );
-}
-
-const AI_STAGES = [
-  { label: 'Parsing case brief', pct: 15 },
-  { label: 'Loading precedents', pct: 32 },
-  { label: 'Synthesising argument', pct: 58 },
-  { label: 'Reviewing evidence', pct: 74 },
-  { label: 'Formulating response', pct: 91 },
-  { label: 'Ready to proceed', pct: 100 },
-];
-
-function AIProcessingIndicator({
-  isPaused,
-  statusText,
-}: {
-  isPaused: boolean;
-  statusText?: string;
-}) {
-  const [stage, setStage] = useState(0);
-  const [displayPct, setDisplayPct] = useState(0);
-
-  useEffect(() => {
-    if (isPaused) return;
-    const id = setInterval(() => {
-      setStage(s => {
-        const next = (s + 1) % AI_STAGES.length;
-        return next;
-      });
-    }, 2200);
-    return () => clearInterval(id);
-  }, [isPaused]);
-
-  // Animate the percentage smoothly
-  useEffect(() => {
-    const target = isPaused ? displayPct : AI_STAGES[stage].pct;
-    const diff = target - displayPct;
-    if (diff === 0) return;
-    const step = diff > 0 ? 1 : -1;
-    const id = setInterval(() => {
-      setDisplayPct(p => {
-        if (Math.abs(AI_STAGES[stage].pct - p) <= 1) { clearInterval(id); return AI_STAGES[stage].pct; }
-        return p + step;
-      });
-    }, 12);
-    return () => clearInterval(id);
-  }, [stage, isPaused]);
-
-  const current = isPaused ? { label: 'Proceedings paused', pct: displayPct } : AI_STAGES[stage];
-
-  return (
-    <div className="space-y-2">
-      <div className="flex justify-between items-center">
-        <span className="text-[9px] tracking-widest text-outline uppercase font-bold">AI Processing</span>
-        <span className={cn("text-[9px] font-mono", isPaused ? "text-outline" : "text-primary")}>{displayPct}%</span>
-      </div>
-      {/* Track */}
-      <div className="h-1.5 w-full bg-outline-variant/30 relative overflow-hidden">
-        <div
-          className="h-full bg-primary transition-all duration-300 relative"
-          style={{ width: `${displayPct}%` }}
-        >
-          {/* shimmer */}
-          {!isPaused && (
-            <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/30 to-transparent animate-[shimmer_1.4s_linear_infinite]" />
-          )}
-        </div>
-      </div>
-      <p className={cn(
-        "text-[9px] tracking-wide leading-snug transition-opacity duration-300",
-        isPaused ? "text-outline opacity-50" : "text-outline"
-      )}>
-        {isPaused ? '— Proceedings paused' : `↳ ${current.label}…`}
-      </p>
-    </div>
-  );
-}
-
 function SimulationView({
   trialState,
   trialPhase,
+  isSidebarCompact,
   isRedactMode,
-  isPaused,
   isLoading,
   onViewEvidence,
   onViewTranscript,
@@ -1322,8 +1388,8 @@ function SimulationView({
 }: {
   trialState: BackendTrialState | null;
   trialPhase: TrialPhase;
+  isSidebarCompact: boolean;
   isRedactMode: boolean;
-  isPaused: boolean;
   isLoading: boolean;
   onViewEvidence: () => void;
   onViewTranscript: () => void;
@@ -1332,7 +1398,7 @@ function SimulationView({
   setIsObjecting: (v: boolean) => void;
   objectionText: string;
   setObjectionText: (v: string) => void;
-  judgeRuling: null | 'SUSTAINED' | 'OVERRULED';
+  judgeRuling: JudgeRulingState;
   judgeStatus: 'LISTENING' | 'EVALUATING' | 'RULING' | 'HALTED';
   setJudgeStatus: (v: 'LISTENING' | 'EVALUATING' | 'RULING' | 'HALTED') => void;
   submitObjection: () => void;
@@ -1385,7 +1451,6 @@ function SimulationView({
 
   // Live countdown
   useEffect(() => {
-    if (isPaused) { if (timerRef.current) clearInterval(timerRef.current); return; }
     timerRef.current = setInterval(() => {
       setSessionSeconds(s => {
         if (s <= 1) { clearInterval(timerRef.current!); return 0; }
@@ -1393,7 +1458,7 @@ function SimulationView({
       });
     }, 1000);
     return () => { if (timerRef.current) clearInterval(timerRef.current); };
-  }, [isPaused, trialPhase]);
+  }, [trialPhase]);
 
   useEffect(() => {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
@@ -1407,10 +1472,13 @@ function SimulationView({
 
     const latestCounselEntry = [...transcript]
       .reverse()
-      .find((entry) =>
-        (entry.agent === 'prosecution' || entry.agent === 'defense')
-        && !entry.redacted
-        && Boolean(entry.content?.trim()),
+      .find(
+        (
+          entry,
+        ): entry is BackendTranscriptEntry & { agent: Extract<BackendAgentRole, 'prosecution' | 'defense'> } =>
+          (entry.agent === 'prosecution' || entry.agent === 'defense')
+          && !entry.redacted
+          && Boolean(entry.content?.trim()),
       );
 
     if (!latestCounselEntry) {
@@ -1517,12 +1585,15 @@ function SimulationView({
 
   return (
     <div
-      className="fixed inset-0 top-16 bottom-20 overflow-hidden"
+      className={cn(
+        'fixed inset-x-0 top-14 bottom-20 overflow-hidden md:top-0',
+        isSidebarCompact ? 'md:left-20' : 'md:left-72',
+      )}
       style={{ cursor: isRedactMode ? 'crosshair' : undefined }}
     >
       {/* Judge Status Banner */}
       <div className={cn(
-        "absolute top-0 left-0 md:left-64 right-0 h-8 flex items-center px-6 gap-3 z-30 border-b border-primary/30 font-mono text-[9px] tracking-[0.3em] uppercase transition-colors duration-300",
+        "absolute top-0 left-0 right-0 h-8 flex items-center px-6 gap-3 z-30 border-b border-primary/30 font-mono text-[9px] tracking-[0.3em] uppercase transition-colors duration-300",
         judgeStatus === 'LISTENING' && "bg-background",
         judgeStatus === 'HALTED' && "bg-primary/10",
         judgeStatus === 'EVALUATING' && "bg-primary/5",
@@ -1543,25 +1614,8 @@ function SimulationView({
         {judgeStatus === 'EVALUATING' && <span className="text-outline animate-pulse">— Analysing grounds for objection…</span>}
       </div>
 
-      {/* SideNavBar - true fixed */}
-      <aside className="absolute left-0 top-0 bottom-0 w-64 flex flex-col bg-background border-r border-primary hidden md:flex">
-        <div className="p-6 border-b border-primary">
-          <h2 className="text-lg font-bold font-sans">Court Management</h2>
-          <p className="text-[10px] text-outline uppercase">Status: Secure</p>
-        </div>
-        <nav className="flex-grow">
-          <SideLink icon={<Gavel className="w-4 h-4" />} label="DOCKET" active />
-          <SideLink icon={<FolderOpen className="w-4 h-4" />} label="EVIDENCE" onClick={onViewEvidence} />
-          <SideLink icon={<FileText className="w-4 h-4" />} label="TRANSCRIPT" onClick={onViewTranscript} />
-          <SideLink icon={<BookOpen className="w-4 h-4" />} label="STATUTES" />
-        </nav>
-        <div className="p-6 border-t border-primary mt-auto">
-          <AIProcessingIndicator isPaused={isPaused} statusText={speechState.message} />
-        </div>
-      </aside>
-
       {/* Simulation Split View OR Verdict Screen */}
-      <div className="absolute top-8 right-0 bottom-0 left-0 md:left-64">
+      <div className="absolute top-8 right-0 bottom-0 left-0">
         <AnimatePresence mode="wait">
           {trialPhase !== 'verdict' ? (
             <motion.div
@@ -1623,7 +1677,10 @@ function SimulationView({
       </div>
 
       {/* Judge HUD */}
-      <div className="fixed bottom-20 left-0 md:left-64 right-0 h-16 bg-background border-t border-primary z-40 flex items-stretch divide-x divide-primary/30">
+      <div className={cn(
+        'fixed bottom-20 left-0 right-0 h-16 bg-background border-t border-primary z-40 flex items-stretch divide-x divide-primary/30 transition-[left] duration-200',
+        isSidebarCompact ? 'md:left-20' : 'md:left-72',
+      )}>
 
         {/* 1. Verdict Lean */}
         <div className="flex-1 flex flex-col justify-center px-5 gap-1 min-w-0 relative overflow-hidden">
@@ -1692,12 +1749,6 @@ function SimulationView({
           </button>
         </div>
 
-        {/* Paused overlay */}
-        {isPaused && (
-          <div className="absolute inset-0 flex items-center justify-center bg-background/80 backdrop-blur-[1px] z-20">
-            <span className="text-[11px] font-bold tracking-[0.4em] text-primary animate-pulse">⚖ OBJECTION — PROCEEDINGS PAUSED</span>
-          </div>
-        )}
       </div>
 
       {/* ── Objection Input Modal ────────────────────────────────────── */}
@@ -1708,7 +1759,7 @@ function SimulationView({
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[60] bg-black/70 backdrop-blur-sm flex items-center justify-center p-6"
+            className="fixed inset-0 z-[90] bg-black/70 backdrop-blur-sm flex items-center justify-center p-6"
             onClick={() => { setIsObjecting(false); setJudgeStatus('LISTENING'); }}
           >
             <motion.div
@@ -1761,7 +1812,7 @@ function SimulationView({
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[70] bg-black/80 backdrop-blur-sm flex items-center justify-center p-6"
+            className="fixed inset-0 z-[95] bg-black/80 backdrop-blur-sm flex items-center justify-center p-6"
           >
             <motion.div
               initial={{ scale: 0.9, opacity: 0 }}
@@ -1770,29 +1821,30 @@ function SimulationView({
               transition={{ type: 'spring', stiffness: 400, damping: 28 }}
               className={cn(
                 "w-full max-w-2xl border-2 p-12 space-y-8 text-center",
-                judgeRuling === 'SUSTAINED' ? "border-primary bg-background" : "border-red-500/60 bg-background"
+                judgeRuling.decision === 'SUSTAINED' ? "border-primary bg-background" : "border-red-500/60 bg-background"
               )}
             >
               <div className="space-y-2">
                 <p className="text-[9px] tracking-[0.5em] text-outline uppercase">Algorithmic Judge — Ruling</p>
                 <h2 className={cn(
                   "text-6xl md:text-8xl font-extrabold font-sans tracking-tighter leading-none",
-                  judgeRuling === 'SUSTAINED' ? "text-primary" : "text-red-400"
+                  judgeRuling.decision === 'SUSTAINED' ? "text-primary" : "text-red-400"
                 )}>
-                  {judgeRuling}
+                  {judgeRuling.decision}
                 </h2>
               </div>
               <p className={cn(
                 "text-sm font-mono tracking-widest uppercase",
-                judgeRuling === 'SUSTAINED' ? "text-primary" : "text-red-300"
+                judgeRuling.decision === 'SUSTAINED' ? "text-primary" : "text-red-300"
               )}>
-                {judgeRuling === 'SUSTAINED'
-                  ? 'OBJECTION SUSTAINED. STRIKING FROM RECORD.'
+                {judgeRuling.decision === 'SUSTAINED'
+                  ? 'OBJECTION SUSTAINED. MATCHING TESTIMONY STRUCK FROM RECORD.'
                   : 'OBJECTION OVERRULED. COUNSEL, PROCEED.'}
               </p>
+              <p className="text-[10px] text-outline normal-case tracking-normal max-w-xl mx-auto">{judgeRuling.reason}</p>
               <div className={cn(
                 "h-px w-full",
-                judgeRuling === 'SUSTAINED' ? "bg-primary/30" : "bg-red-500/30"
+                judgeRuling.decision === 'SUSTAINED' ? "bg-primary/30" : "bg-red-500/30"
               )} />
               <button
                 onClick={resumeProceedings}
@@ -1829,35 +1881,43 @@ function TranscriptView({
   trialState?: BackendTrialState | null;
 }) {
   const transcriptEndRef = useRef<HTMLDivElement>(null);
+  const caseTitle = trialState?.case.title || 'Case pending';
+  const configuredDefendant = extractDescriptionField(trialState?.case.description, 'Defendant');
+  const configuredPlea = trialState?.case.plea || extractDescriptionField(trialState?.case.description, 'Plea') || 'NOT SPECIFIED';
+  const configuredProsecution = extractDescriptionField(trialState?.case.description, 'Prosecution') || 'CASE COUNSEL';
+  const configuredDefense = extractDescriptionField(trialState?.case.description, 'Defense') || 'DEFENSE COUNSEL';
+  const hearingDate = trialState?.updated_at
+    ? new Date(trialState.updated_at).toLocaleDateString('en-GB')
+    : new Date().toLocaleDateString('en-GB');
+  const proceedingsLabel = formatStageLabel(trialState?.stage);
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, []);
 
   return (
-    <main className="flex min-h-screen pt-16 bg-background">
-
-      {/* Sidebar */}
-      <aside className="hidden md:flex flex-none w-64 flex-col bg-background border-r border-primary fixed top-16 bottom-0 left-0">
-        <div className="p-6 border-b border-primary">
-          <h2 className="text-lg font-bold font-sans">Court Management</h2>
-          <p className="text-[10px] text-outline uppercase">Status: Secure</p>
-        </div>
-        <nav className="flex-grow">
-          <SideLink icon={<Gavel className="w-4 h-4" />} label="DOCKET" onClick={onBack} />
-          <SideLink icon={<FolderOpen className="w-4 h-4" />} label="EVIDENCE" onClick={onViewEvidence} />
-          <SideLink icon={<FileText className="w-4 h-4" />} label="TRANSCRIPT" active />
-          <SideLink icon={<BookOpen className="w-4 h-4" />} label="STATUTES" onClick={onBack} />
-        </nav>
-        <div className="p-6 border-t border-primary mt-auto">
-          <p className="text-[9px] text-outline tracking-widest uppercase">Case No. {caseId || 'N/A'}</p>
-          <p className="text-[9px] text-outline tracking-widest uppercase mt-1">Live Session Transcript</p>
-        </div>
-      </aside>
-
+    <main className="flex min-h-screen bg-background">
       {/* Main content */}
-      <div className="flex-1 md:ml-64 overflow-y-auto pb-8">
+      <div className="flex-1 overflow-y-auto pb-8">
         <div className="max-w-4xl mx-auto px-6 py-8 space-y-0">
+
+          <div className="mb-6 flex flex-wrap items-center justify-between gap-3 border border-primary/20 px-4 py-3 text-[10px] tracking-widest">
+            <div className="text-outline">CASE NO. {caseId || 'N/A'} - LIVE SESSION TRANSCRIPT</div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={onBack}
+                className="border border-primary/40 px-3 py-1 text-outline hover:border-primary hover:text-primary"
+              >
+                DOCKET
+              </button>
+              <button
+                onClick={onViewEvidence}
+                className="border border-primary/40 px-3 py-1 text-outline hover:border-primary hover:text-primary"
+              >
+                EVIDENCE
+              </button>
+            </div>
+          </div>
 
           {/* ── CAUSE TITLE HEADER ───────────────────────────────────────────── */}
           <div className="border-2 border-primary mb-8">
@@ -1874,14 +1934,14 @@ function TranscriptView({
               <div className="border-t border-primary/30 pt-3 space-y-1">
                 <div className="flex justify-between items-start">
                   <div>
-                    <p className="font-bold tracking-wider uppercase">STATE OF BHARATNODE ...................................................... COMPLAINANT</p>
-                    <p className="text-outline text-[9px] tracking-[0.2em] ml-2">THROUGH: ADDITIONAL PUBLIC PROSECUTOR VIKRAM SOOD</p>
+                    <p className="font-bold tracking-wider uppercase">{caseTitle} ...................................................... COMPLAINANT</p>
+                    <p className="text-outline text-[9px] tracking-[0.2em] ml-2">THROUGH: {configuredProsecution.toUpperCase()}</p>
                   </div>
                 </div>
                 <p className="text-center tracking-[0.6em] py-1 text-outline">— VERSUS —</p>
                 <div>
-                  <p className="font-bold tracking-wider uppercase">ARVIND MEHTA S/O RAJESH MEHTA ...................................... ACCUSED</p>
-                  <p className="text-outline text-[9px] tracking-[0.2em] ml-2">REPRESENTED BY: ADV. REENA THOMAS (REGD. NO. BAR-D-00891)</p>
+                  <p className="font-bold tracking-wider uppercase">{(configuredDefendant || 'UNSPECIFIED DEFENDANT').toUpperCase()} ...................................... ACCUSED</p>
+                  <p className="text-outline text-[9px] tracking-[0.2em] ml-2">REPRESENTED BY: {configuredDefense.toUpperCase()}</p>
                 </div>
               </div>
               <div className="border-t border-primary/30 pt-3 flex justify-between items-center">
@@ -1890,11 +1950,11 @@ function TranscriptView({
               </div>
               <div className="flex justify-between items-center">
                 <span className="text-outline tracking-[0.3em] uppercase text-[9px]">Date of Hearing</span>
-                <span className="tracking-widest">14.10.2024</span>
+                <span className="tracking-widest">{hearingDate}</span>
               </div>
               <div className="flex justify-between items-center">
                 <span className="text-outline tracking-[0.3em] uppercase text-[9px]">Nature of Proceedings</span>
-                <span className="tracking-widest uppercase">Recording of Evidence — PW-1 (Examination-in-Chief &amp; Cross)</span>
+                <span className="tracking-widest uppercase">{proceedingsLabel} — Plea: {configuredPlea}</span>
               </div>
             </div>
           </div>
@@ -1974,7 +2034,7 @@ function TranscriptView({
             <div className="px-8 py-6 grid grid-cols-1 md:grid-cols-3 gap-6 divide-y md:divide-y-0 md:divide-x divide-primary/30">
               <div className="md:pr-6 space-y-1">
                 <p className="text-[8px] tracking-[0.4em] text-outline uppercase mb-1">Deponent Signature</p>
-                <p className="text-[10px] text-primary tracking-wide">DR. PRIYA NAIR (PW-1)</p>
+                <p className="text-[10px] text-primary tracking-wide">{(configuredDefendant || 'UNSPECIFIED DEFENDANT').toUpperCase()}</p>
                 <p className="text-[9px] text-outline">Digital Thumbprint: 0xFE3A...91B7</p>
               </div>
               <div className="pt-4 md:pt-0 md:px-6 space-y-1">

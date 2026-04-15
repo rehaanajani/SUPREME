@@ -4,6 +4,7 @@ main.py — SUPREME Courtroom Simulator entry point.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import logging
 import time
 import uuid
@@ -14,6 +15,7 @@ from fastapi.responses import JSONResponse
 from redis.exceptions import AuthenticationError as RedisAuthenticationError
 from redis.exceptions import ConnectionError as RedisConnectionError
 
+from app.observability.request_context import reset_request_id, set_request_id
 from app.models.session_store import session_store
 from app.routes.api import router
 from config import APP_HOST, APP_PORT, APP_LOG_LEVEL, CORS_ORIGINS, DEMO_MODE
@@ -25,6 +27,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("supreme")
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    mode = "DEMO" if DEMO_MODE else "PRODUCTION"
+    logger.info("SUPREME Courtroom Simulator starting - mode: %s log_level=%s", mode, APP_LOG_LEVEL)
+    try:
+        yield
+    finally:
+        await session_store.close()
+        logger.info("Redis connection closed.")
+
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="SUPREME — AI Courtroom Simulator",
@@ -35,6 +48,7 @@ app = FastAPI(
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 # ── CORS (open for demo) ──────────────────────────────────────────────────────
@@ -51,32 +65,36 @@ app.add_middleware(
 async def request_context_middleware(request: Request, call_next):
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
     request.state.request_id = request_id
+    request_token = set_request_id(request_id)
     started_at = time.perf_counter()
 
     try:
-        response = await call_next(request)
-    except Exception:
+        try:
+            response = await call_next(request)
+        except Exception:
+            duration_ms = (time.perf_counter() - started_at) * 1000
+            logger.exception(
+                "Request failed | id=%s method=%s path=%s duration_ms=%.2f",
+                request_id,
+                request.method,
+                request.url.path,
+                duration_ms,
+            )
+            raise
+
         duration_ms = (time.perf_counter() - started_at) * 1000
-        logger.exception(
-            "Request failed | id=%s method=%s path=%s duration_ms=%.2f",
+        response.headers["X-Request-ID"] = request_id
+        logger.info(
+            "Request complete | id=%s method=%s path=%s status=%s duration_ms=%.2f",
             request_id,
             request.method,
             request.url.path,
+            response.status_code,
             duration_ms,
         )
-        raise
-
-    duration_ms = (time.perf_counter() - started_at) * 1000
-    response.headers["X-Request-ID"] = request_id
-    logger.info(
-        "Request complete | id=%s method=%s path=%s status=%s duration_ms=%.2f",
-        request_id,
-        request.method,
-        request.url.path,
-        response.status_code,
-        duration_ms,
-    )
-    return response
+        return response
+    finally:
+        reset_request_id(request_token)
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(router)
@@ -89,19 +107,6 @@ async def root():
         "message": "Backend is running. Use the frontend on port 3000.",
         "docs_url": "/docs",
     }
-
-
-# ── Lifecycle ─────────────────────────────────────────────────────────────────
-@app.on_event("startup")
-async def on_startup():
-    mode = "DEMO" if DEMO_MODE else "PRODUCTION"
-    logger.info("SUPREME Courtroom Simulator starting — mode: %s log_level=%s", mode, APP_LOG_LEVEL)
-
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    await session_store.close()
-    logger.info("Redis connection closed.")
 
 
 # ── Global error handler ─────────────────────────────────────────────────────

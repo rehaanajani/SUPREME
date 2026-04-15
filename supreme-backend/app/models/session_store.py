@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import redis.asyncio as aioredis
+from redis.exceptions import WatchError
 
 from config import REDIS_URL as _REDIS_URL_RAW, SESSION_TTL
 
@@ -37,6 +38,34 @@ class SessionStore:
         client = await self._get_client()
         key = f"session:{state.session_id}"
         await client.set(key, state.model_dump_json(), ex=SESSION_TTL)
+
+    async def save_if_version(self, state: TrialState, expected_version: int) -> bool:
+        client = await self._get_client()
+        key = f"session:{state.session_id}"
+
+        while True:
+            async with client.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    if raw is None:
+                        await pipe.reset()
+                        return False
+
+                    current = json.loads(raw)
+                    current_version = int(current.get("version", 0))
+                    if current_version != expected_version:
+                        await pipe.reset()
+                        return False
+
+                    state.version = expected_version + 1
+                    state_payload = state.model_dump_json()
+                    pipe.multi()
+                    pipe.set(key, state_payload, ex=SESSION_TTL)
+                    await pipe.execute()
+                    return True
+                except WatchError:
+                    continue
 
     async def load(self, session_id: str) -> TrialState | None:
         client = await self._get_client()

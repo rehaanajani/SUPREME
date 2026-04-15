@@ -12,8 +12,8 @@
   --color-surface-container-low: #1b1b1b;
   --color-surface-container-lowest: #0e0e0e;
   --color-surface-container-highest: #353535;
-  --color-outline: #919191;
-  --color-outline-variant: #474747;
+  --color-outline: #9c9c9c;
+  --color-outline-variant: #535353;
   --color-error: #ffb4ab;
 }
 
@@ -44,6 +44,44 @@
 
   .glass-surface {
     @apply bg-surface-container/80 backdrop-blur-xl border border-primary/20;
+  }
+
+  .config-grid-bg {
+    background-color: #0f0f0f;
+    background-image:
+      radial-gradient(circle at 20% 15%, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0) 45%),
+      linear-gradient(to right, rgba(255, 255, 255, 0.06) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(255, 255, 255, 0.06) 1px, transparent 1px);
+    background-size: auto, 36px 36px, 36px 36px;
+    background-position: center, center, center;
+  }
+
+  .config-panel {
+    @apply border bg-surface-container-low/85 border-outline/55 backdrop-blur-sm;
+  }
+
+  .status-badge {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.1em] border;
+  }
+
+  .status-draft {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.1em] border bg-surface-container-low border-outline-variant text-primary/75;
+  }
+
+  .status-incomplete {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.1em] border bg-surface-container-lowest border-error/45 text-error;
+  }
+
+  .status-ready {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.1em] border bg-primary/10 border-primary/45 text-primary;
+  }
+
+  .step-pill {
+    @apply inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.08em] border border-outline-variant bg-surface-container-low text-primary/70;
+  }
+
+  .step-pill-active {
+    @apply inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.08em] border border-primary/60 bg-primary/12 text-primary;
   }
 }
 
@@ -103,4 +141,17 @@
 .voice-bar:nth-child(5) {
   height: 20px;
   animation-delay: -0.3s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .voice-bar.active {
+    animation: none !important;
+    transform: scaleY(0.65);
+  }
+
+  .shimmer,
+  .animate-shimmer,
+  [class*="shimmer"] {
+    animation: none !important;
+  }
 }

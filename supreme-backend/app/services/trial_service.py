@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from time import perf_counter
 
 from app.agents.orchestrator import (
     fast_forward,
@@ -25,15 +26,17 @@ from app.models.trial import (
     ControlAction,
     ControlRequest,
     ControlResponse,
+    ObjectionRuling,
     CreateCaseRequest,
     CreateCaseResponse,
     Difficulty,
     NextTurnResponse,
-    TranscriptEntry,
     TrialState,
     TrialStage,
     VerdictResponse,
 )
+from app.observability.diagnostics import build_request_diagnostics
+from app.serializers.trial_state import serialize_public_entry, serialize_public_state
 from config import TURNS_PER_STAGE
 from fastapi import HTTPException
 
@@ -49,9 +52,16 @@ async def _load_or_404(session_id: str) -> TrialState:
     return state
 
 
-async def _save(state: TrialState) -> None:
+async def _save_with_conflict(state: TrialState, expected_version: int) -> None:
     state.updated_at = datetime.utcnow()
-    await session_store.save(state)
+    saved = await session_store.save_if_version(state, expected_version)
+    if not saved:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Session state changed concurrently. Reload session and retry the action."
+            ),
+        )
 
 
 # ── Service functions ─────────────────────────────────────────────────────────
@@ -67,6 +77,7 @@ async def create_case(req: CreateCaseRequest) -> CreateCaseResponse:
         description=req.description,
         charges=req.charges,
         evidence=req.evidence,
+        plea=req.plea,
         difficulty=difficulty,
     )
 
@@ -87,33 +98,49 @@ async def get_session(session_id: str) -> TrialState:
 
 async def next_turn(session_id: str) -> NextTurnResponse:
     """Run one agent turn and persist the result."""
+    started_at = perf_counter() * 1000
     state = await _load_or_404(session_id)
+    base_version = state.version
 
     if state.stage == TrialStage.COMPLETE:
         raise HTTPException(status_code=400, detail="Trial is already complete.")
 
     state, entry = await run_next_turn(state)
-    await _save(state)
+    await _save_with_conflict(state, base_version)
 
     if entry is None:
         raise HTTPException(status_code=400, detail="No turn was produced.")
 
+    model_id = None
+    rag_source = None
+    if entry.debug:
+        llm_call = next((trace for trace in entry.debug.tool_calls if trace.name == "openrouter.chat.completions"), None)
+        rag_call = next((trace for trace in entry.debug.tool_calls if trace.name == "retrieve_precedents"), None)
+        if llm_call and isinstance(llm_call.input, dict):
+            model_id = llm_call.input.get("model")
+        if rag_call and isinstance(rag_call.output, dict):
+            rag_source = rag_call.output.get("source")
+
     return NextTurnResponse(
         session_id=session_id,
-        entry=entry,
+        entry=serialize_public_entry(entry),
         stage=state.stage,
         active_agent=state.active_agent,
         is_complete=state.stage == TrialStage.COMPLETE,
+        diagnostics=build_request_diagnostics(started_at, model_id=model_id, rag_source=rag_source),
     )
 
 
 async def control(session_id: str, req: ControlRequest) -> ControlResponse:
     """Apply a user control action (objection / redact / inject)."""
+    started_at = perf_counter() * 1000
     state = await _load_or_404(session_id)
+    base_version = state.version
+    objection: ObjectionRuling | None = None
 
     if req.action == ControlAction.OBJECTION:
-        state = await handle_objection(state, req.payload)
-        result = "Objection noted and recorded in the transcript."
+        state, objection = await handle_objection(state, req.payload)
+        result = "Objection evaluated by the bench."
 
     elif req.action == ControlAction.REDACT:
         if not req.payload:
@@ -130,18 +157,22 @@ async def control(session_id: str, req: ControlRequest) -> ControlResponse:
     else:
         raise HTTPException(status_code=400, detail=f"Unknown action: {req.action}")
 
-    await _save(state)
+    await _save_with_conflict(state, base_version)
     return ControlResponse(
         session_id=session_id,
         action=req.action,
         result=result,
-        state=state.model_dump(),
+        state=serialize_public_state(state),
+        objection=objection,
+        diagnostics=build_request_diagnostics(started_at),
     )
 
 
 async def force_verdict(session_id: str) -> VerdictResponse:
     """Force the judge to deliver the verdict immediately."""
+    started_at = perf_counter() * 1000
     state = await _load_or_404(session_id)
+    base_version = state.version
 
     if state.stage == TrialStage.COMPLETE and state.verdict:
         logger.info("Verdict already exists for session %s.", session_id)
@@ -149,21 +180,30 @@ async def force_verdict(session_id: str) -> VerdictResponse:
             session_id=session_id,
             verdict=state.verdict,
             transcript_length=len(state.transcript),
+            diagnostics=build_request_diagnostics(started_at),
         )
 
-    state, _ = await run_verdict(state)
-    await _save(state)
+    state, verdict_entry = await run_verdict(state)
+    await _save_with_conflict(state, base_version)
+
+    model_id = None
+    if verdict_entry.debug:
+        llm_call = next((trace for trace in verdict_entry.debug.tool_calls if trace.name == "openrouter.chat.completions"), None)
+        if llm_call and isinstance(llm_call.input, dict):
+            model_id = llm_call.input.get("model")
 
     return VerdictResponse(
         session_id=session_id,
         verdict=state.verdict,
         transcript_length=len(state.transcript),
+        diagnostics=build_request_diagnostics(started_at, model_id=model_id),
     )
 
 
 async def reset_trial(session_id: str) -> CreateCaseResponse:
     """Reset the trial to initial state, preserving the case details."""
     state = await _load_or_404(session_id)
+    base_version = state.version
     case = state.case
 
     new_state = TrialState(
@@ -171,7 +211,7 @@ async def reset_trial(session_id: str) -> CreateCaseResponse:
         case=case,
         turns_per_stage=state.turns_per_stage,
     )
-    await session_store.save(new_state)
+    await _save_with_conflict(new_state, base_version)
 
     return CreateCaseResponse(
         session_id=session_id,
@@ -182,12 +222,21 @@ async def reset_trial(session_id: str) -> CreateCaseResponse:
 
 async def fast_forward_trial(session_id: str) -> VerdictResponse:
     """Skip remaining stages and jump straight to the verdict."""
+    started_at = perf_counter() * 1000
     state = await _load_or_404(session_id)
-    state, _ = await fast_forward(state)
-    await _save(state)
+    base_version = state.version
+    state, verdict_entry = await fast_forward(state)
+    await _save_with_conflict(state, base_version)
+
+    model_id = None
+    if verdict_entry.debug:
+        llm_call = next((trace for trace in verdict_entry.debug.tool_calls if trace.name == "openrouter.chat.completions"), None)
+        if llm_call and isinstance(llm_call.input, dict):
+            model_id = llm_call.input.get("model")
 
     return VerdictResponse(
         session_id=session_id,
         verdict=state.verdict,
         transcript_length=len(state.transcript),
+        diagnostics=build_request_diagnostics(started_at, model_id=model_id),
     )
