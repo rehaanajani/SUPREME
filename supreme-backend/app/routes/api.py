@@ -4,7 +4,10 @@ app/routes/api.py — All FastAPI route definitions for SUPREME.
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+import io
+import logging
+
+from fastapi import APIRouter, File, UploadFile
 from fastapi.responses import JSONResponse
 
 from app.models.trial import (
@@ -15,7 +18,69 @@ from app.models.session_store import session_store, session_store_diagnostics
 from app.services import trial_service
 from app.tools.rag import rag_diagnostics
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+
+# ── Evidence File Upload ──────────────────────────────────────────────────────
+
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+
+
+def _extract_text_from_pdf(data: bytes) -> list[str]:
+    """Extract text from a PDF using PyMuPDF."""
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(stream=data, filetype="pdf")
+        lines: list[str] = []
+        for page in doc:
+            text = page.get_text().strip()
+            if text:
+                lines.append(text)
+        doc.close()
+        return lines if lines else ["[PDF uploaded — no extractable text found]"]
+    except Exception as exc:
+        logger.warning("PDF extraction failed: %s", exc)
+        return [f"[PDF uploaded — extraction error: {exc}]"]
+
+
+def _describe_image(filename: str) -> list[str]:
+    """Return a placeholder evidence entry for an uploaded image."""
+    return [f"[Image evidence uploaded: {filename}]"]
+
+
+@router.post("/api/upload-evidence", tags=["evidence"])
+async def upload_evidence(file: UploadFile = File(...)):
+    """
+    Accept a PDF or image file and return extracted text as evidence lines.
+    Supported: .pdf, .png, .jpg, .jpeg, .webp, .bmp, .tiff
+    """
+    if not file.filename:
+        return JSONResponse(status_code=400, content={"error": "No file provided"})
+
+    raw = await file.read()
+    if len(raw) > MAX_FILE_SIZE:
+        return JSONResponse(status_code=413, content={"error": f"File exceeds {MAX_FILE_SIZE // (1024*1024)} MB limit"})
+
+    ext = (file.filename.rsplit(".", 1)[-1] if "." in file.filename else "").lower()
+
+    if ext == "pdf":
+        evidence_lines = _extract_text_from_pdf(raw)
+    elif ext in ("png", "jpg", "jpeg", "webp", "bmp", "tiff"):
+        evidence_lines = _describe_image(file.filename)
+    else:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Unsupported file type: .{ext}. Use PDF or image files."},
+        )
+
+    return {
+        "filename": file.filename,
+        "type": "pdf" if ext == "pdf" else "image",
+        "evidence_lines": evidence_lines,
+        "total_lines": len(evidence_lines),
+    }
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────

@@ -155,3 +155,25 @@ export async function request<T>(path: string, init?: RequestInit & { timeoutMs?
 
   return body as T;
 }
+
+/**
+ * Upload a file via multipart/form-data (no JSON Content-Type).
+ */
+export async function uploadFile<T>(path: string, file: File): Promise<T> {
+  const url = joinUrl(path);
+  const form = new FormData();
+  form.append('file', file);
+
+  const response = await fetch(url, { method: 'POST', body: form });
+
+  if (!response.ok) {
+    const errBody = await response.json().catch(() => ({}));
+    throw new ApiError(
+      (errBody as Record<string, string>)?.error || `Upload failed with status ${response.status}`,
+      response.status,
+      errBody,
+    );
+  }
+
+  return (await response.json()) as T;
+}

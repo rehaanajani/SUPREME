@@ -48,6 +48,27 @@ type VoiceModeStatus = 'idle' | 'starting' | 'listening' | 'processing' | 'error
 const TRIAL_PHASES: TrialPhase[] = ['opening', 'evidence', 'cross_examination', 'verdict'];
 const SESSION_STORAGE_KEY = 'supreme.session_id';
 const VERDICT_MESSAGE_CACHE_KEY = 'supreme.verdict_message_cache';
+
+// ── Audio Unlock: prime speechSynthesis on first user interaction ────────────
+// Browsers block speechSynthesis.speak() unless triggered from a user gesture.
+// We speak a silent utterance on the first click to "unlock" audio permanently.
+let audioUnlocked = false;
+function unlockAudio() {
+  if (audioUnlocked) return;
+  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+  const synth = window.speechSynthesis;
+  const silent = new SpeechSynthesisUtterance('');
+  silent.volume = 0;
+  silent.rate = 10;
+  synth.speak(silent);
+  audioUnlocked = true;
+  document.removeEventListener('click', unlockAudio, true);
+  document.removeEventListener('keydown', unlockAudio, true);
+}
+if (typeof document !== 'undefined') {
+  document.addEventListener('click', unlockAudio, true);
+  document.addEventListener('keydown', unlockAudio, true);
+}
 const VAPI_PUBLIC_KEY = (import.meta.env.VITE_VAPI_PUBLIC_KEY as string | undefined)?.trim() || '';
 const VAPI_MODEL_PROVIDER = (import.meta.env.VITE_VAPI_MODEL_PROVIDER as string | undefined)?.trim() || 'openai';
 const VAPI_MODEL = (import.meta.env.VITE_VAPI_MODEL as string | undefined)?.trim() || 'gpt-4o-mini';
@@ -226,19 +247,35 @@ function extractVoiceTexts(message: any): string[] {
     values.push(text);
   };
 
+  // Direct transcript from Vapi (user speech)
+  if (message?.type === 'transcript' && message?.role === 'user') {
+    add(message?.transcript);
+  }
+
+  // AI assistant response (contains our structured command echo)
+  if (message?.type === 'transcript' && message?.role === 'assistant') {
+    add(message?.transcript);
+  }
+
+  // Conversation update with message list
+  if (message?.type === 'conversation-update' && Array.isArray(message?.conversation)) {
+    for (const item of message.conversation) {
+      if (item?.role === 'user' || item?.role === 'assistant') {
+        add(item?.content);
+      }
+    }
+  }
+
+  // Legacy fallbacks
   add(message?.transcript);
   add(message?.text);
   add(message?.content);
   add(message?.message?.content);
 
-  const transcriptText = message?.transcript?.text;
-  add(transcriptText);
-
   if (Array.isArray(message?.messages)) {
     for (const item of message.messages) {
       add(item?.content);
       add(item?.text);
-      add(item?.transcript);
     }
   }
 
@@ -992,12 +1029,26 @@ export default function App() {
             {
               role: 'system',
               content: [
-                'You are the courtroom voice command bridge.',
-                'Always keep responses under 15 words.',
-                'Recognize and repeat concise command phrases from the user.',
-                'Supported commands: next turn, objection <reason>, redact <text>, inject testimony <text>, fast forward verdict, reset trial, open evidence, open transcript, open docket.',
-                'If unclear, ask user to repeat in one short sentence.',
-              ].join(' '),
+                'You are a courtroom voice command assistant. Your ONLY job is to recognize spoken commands and IMMEDIATELY respond with a short verbal confirmation.',
+                '',
+                'COMMANDS YOU MUST RECOGNIZE:',
+                '- "next" / "proceed" / "continue" / "next turn" → respond: "Next turn."',
+                '- "objection" followed by a reason → respond: "Objection noted: [their reason]." IMPORTANT: include the FULL reason they gave.',
+                '- "objection" alone → respond: "Objection noted."',
+                '- "fast forward" / "verdict" / "give verdict" → respond: "Fast forwarding to verdict."',
+                '- "reset" / "restart" / "new trial" → respond: "Resetting trial."',
+                '- "open evidence" → respond: "Opening evidence."',
+                '- "open transcript" → respond: "Opening transcript."',
+                '- "redact" followed by text → respond: "Redacting: [text]."',
+                '- "testimony" / "inject" followed by text → respond: "Injecting testimony: [text]."',
+                '',
+                'RULES:',
+                '1. ALWAYS respond with the confirmation phrase listed above. This is your verbal feedback.',
+                '2. Keep ALL responses under 10 words.',
+                '3. If the user says something that is NOT a command, say: "Command not recognized. Try: next, objection, or verdict."',
+                '4. For objections, ALWAYS include the reason the user stated. Example: User says "objection, that is hearsay" → respond "Objection noted: that is hearsay."',
+                '5. Do NOT have a conversation. Do NOT ask follow-up questions. Just confirm and wait.',
+              ].join('\n'),
             },
           ],
         },
@@ -1521,10 +1572,36 @@ function ConfigView({
   const [witnessListText, setWitnessListText] = useState('');
   const [defenseEvidenceText, setDefenseEvidenceText] = useState('');
   const [pastSessions, setPastSessions] = useState<{ session_id: string; title: string; stage: string; updated_at: string | null }[]>([]);
+  const [prosUploadedFiles, setProsUploadedFiles] = useState<string[]>([]);
+  const [defUploadedFiles, setDefUploadedFiles] = useState<string[]>([]);
+  const [uploadingFor, setUploadingFor] = useState<'prosecution' | 'defense' | null>(null);
+  const prosFileRef = useRef<HTMLInputElement>(null);
+  const defFileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     listSessions().then(setPastSessions).catch(() => { });
   }, []);
+
+  const handleFileUpload = async (file: File, side: 'prosecution' | 'defense') => {
+    setUploadingFor(side);
+    try {
+      const { uploadFile } = await import('./api/client');
+      const result = await uploadFile<{ filename: string; evidence_lines: string[]; type: string }>('/api/upload-evidence', file);
+      const newText = result.evidence_lines.join('\n');
+      if (side === 'prosecution') {
+        setProsecutionEvidenceText((prev) => prev ? `${prev}\n${newText}` : newText);
+        setProsUploadedFiles((prev) => [...prev, result.filename]);
+      } else {
+        setDefenseEvidenceText((prev) => prev ? `${prev}\n${newText}` : newText);
+        setDefUploadedFiles((prev) => [...prev, result.filename]);
+      }
+    } catch (err) {
+      console.error('Evidence upload failed:', err);
+      alert(`Upload failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    } finally {
+      setUploadingFor(null);
+    }
+  };
 
   const submitCase = () => {
     const charges = splitLines(chargesText);
@@ -1648,15 +1725,39 @@ function ConfigView({
             <div className="space-y-6">
               <div className="flex items-center justify-between">
                 <label className="block text-[10px] tracking-widest text-outline">PROSECUTION EVIDENCE</label>
-                <span className="text-[10px] text-outline">MAX_FILE_SIZE: 50MB</span>
+                <span className="text-[10px] text-outline">PDF / IMAGE / TEXT — MAX 50MB</span>
               </div>
-              <div className="border border-primary border-dashed p-12 text-center group cursor-pointer hover:bg-primary/5 transition-colors">
+              <div
+                className="border border-primary border-dashed p-12 text-center group cursor-pointer hover:bg-primary/5 transition-colors"
+                onClick={() => prosFileRef.current?.click()}
+              >
+                <input
+                  ref={prosFileRef}
+                  type="file"
+                  accept=".pdf,.png,.jpg,.jpeg,.webp,.bmp,.tiff"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) handleFileUpload(f, 'prosecution');
+                    e.target.value = '';
+                  }}
+                />
                 <Upload className="w-10 h-10 mx-auto mb-4 text-outline group-hover:text-primary transition-colors" />
-                <p className="text-xs tracking-widest text-outline group-hover:text-primary">PASTE ONE EVIDENCE ITEM PER LINE</p>
+                <p className="text-xs tracking-widest text-outline group-hover:text-primary">
+                  {uploadingFor === 'prosecution' ? 'UPLOADING...' : 'CLICK TO UPLOAD PDF / IMAGE — OR TYPE BELOW'}
+                </p>
+                {prosUploadedFiles.length > 0 && (
+                  <div className="mt-3 flex flex-wrap gap-2 justify-center">
+                    {prosUploadedFiles.map((name, i) => (
+                      <span key={i} className="text-[9px] bg-primary/20 text-primary px-2 py-1 tracking-wider">{name}</span>
+                    ))}
+                  </div>
+                )}
                 <textarea
                   className="mt-4 w-full bg-transparent border border-primary/40 p-3 text-[10px] tracking-widest text-primary normal-case min-h-[110px] focus:outline-none"
                   placeholder="Example: CCTV footage from west gate"
                   value={prosecutionEvidenceText}
+                  onClick={(e) => e.stopPropagation()}
                   onChange={(event) => setProsecutionEvidenceText(event.target.value)}
                 />
               </div>
@@ -1702,15 +1803,39 @@ function ConfigView({
             <div className="space-y-6">
               <div className="flex items-center justify-between">
                 <label className="block text-[10px] tracking-widest text-outline">DEFENSE EVIDENCE</label>
-                <span className="text-[10px] text-outline">MAX_FILE_SIZE: 50MB</span>
+                <span className="text-[10px] text-outline">PDF / IMAGE / TEXT — MAX 50MB</span>
               </div>
-              <div className="border border-primary border-dashed p-12 text-center group cursor-pointer hover:bg-primary/5 transition-colors">
+              <div
+                className="border border-primary border-dashed p-12 text-center group cursor-pointer hover:bg-primary/5 transition-colors"
+                onClick={() => defFileRef.current?.click()}
+              >
+                <input
+                  ref={defFileRef}
+                  type="file"
+                  accept=".pdf,.png,.jpg,.jpeg,.webp,.bmp,.tiff"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) handleFileUpload(f, 'defense');
+                    e.target.value = '';
+                  }}
+                />
                 <Upload className="w-10 h-10 mx-auto mb-4 text-outline group-hover:text-primary transition-colors" />
-                <p className="text-xs tracking-widest text-outline group-hover:text-primary">PASTE ONE EVIDENCE ITEM PER LINE</p>
+                <p className="text-xs tracking-widest text-outline group-hover:text-primary">
+                  {uploadingFor === 'defense' ? 'UPLOADING...' : 'CLICK TO UPLOAD PDF / IMAGE — OR TYPE BELOW'}
+                </p>
+                {defUploadedFiles.length > 0 && (
+                  <div className="mt-3 flex flex-wrap gap-2 justify-center">
+                    {defUploadedFiles.map((name, i) => (
+                      <span key={i} className="text-[9px] bg-primary/20 text-primary px-2 py-1 tracking-wider">{name}</span>
+                    ))}
+                  </div>
+                )}
                 <textarea
                   className="mt-4 w-full bg-transparent border border-primary/40 p-3 text-[10px] tracking-widest text-primary normal-case min-h-[110px] focus:outline-none"
                   placeholder="Example: Hospital admission records"
                   value={defenseEvidenceText}
+                  onClick={(e) => e.stopPropagation()}
                   onChange={(event) => setDefenseEvidenceText(event.target.value)}
                 />
               </div>
