@@ -4,6 +4,10 @@ import {
   Gavel,
   FolderOpen,
   FileText,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Menu,
+  X,
   Mic,
   StepBack,
   StepForward,
@@ -71,10 +75,20 @@ if (typeof document !== 'undefined') {
 const VAPI_PUBLIC_KEY = (import.meta.env.VITE_VAPI_PUBLIC_KEY as string | undefined)?.trim() || '';
 const VAPI_MODEL_PROVIDER = (import.meta.env.VITE_VAPI_MODEL_PROVIDER as string | undefined)?.trim() || 'openai';
 const VAPI_MODEL = (import.meta.env.VITE_VAPI_MODEL as string | undefined)?.trim() || 'gpt-4o-mini';
-const VAPI_VOICE_PROVIDER = (import.meta.env.VITE_VAPI_VOICE_PROVIDER as string | undefined)?.trim() || 'vapi';
+const RAW_VAPI_VOICE_PROVIDER = (import.meta.env.VITE_VAPI_VOICE_PROVIDER as string | undefined)?.trim() || 'vapi';
 const VAPI_PROSECUTOR_VOICE = (import.meta.env.VITE_VAPI_PROSECUTOR_VOICE as string | undefined)?.trim() || '';
 const VAPI_DEFENSE_VOICE = (import.meta.env.VITE_VAPI_DEFENSE_VOICE as string | undefined)?.trim() || '';
 const VAPI_JUDGE_VOICE = (import.meta.env.VITE_VAPI_JUDGE_VOICE as string | undefined)?.trim() || '';
+const VAPI_DEBUG_ENABLED = ((import.meta.env.VITE_DEBUG_VOICE as string | undefined)?.trim().toLowerCase() || '') === 'true';
+
+function normalizeVapiVoiceProvider(provider: string): string {
+  const lower = provider.trim().toLowerCase();
+  if (!lower) return 'vapi';
+  if (lower === 'elevenlabs' || lower === '11labs' || lower === 'eleven') return '11labs';
+  return lower;
+}
+
+const VAPI_VOICE_PROVIDER = normalizeVapiVoiceProvider(RAW_VAPI_VOICE_PROVIDER);
 
 type TranscriptDisplayEntry = {
   id: string | number;
@@ -121,17 +135,23 @@ export function unblockSpeech() { speechBlocked = false; }
 export function isSpeechBlocked() { return speechBlocked; }
 
 function getVapiVoiceId(role: VoiceRole): string {
-  if (role === 'prosecution') {
-    return VAPI_PROSECUTOR_VOICE || VAPI_JUDGE_VOICE || VAPI_DEFENSE_VOICE;
-  }
-  if (role === 'defense') {
-    return VAPI_DEFENSE_VOICE || VAPI_JUDGE_VOICE || VAPI_PROSECUTOR_VOICE;
-  }
-  return VAPI_JUDGE_VOICE || VAPI_PROSECUTOR_VOICE || VAPI_DEFENSE_VOICE;
+  if (role === 'prosecution') return VAPI_PROSECUTOR_VOICE;
+  if (role === 'defense') return VAPI_DEFENSE_VOICE;
+  return VAPI_JUDGE_VOICE;
 }
 
 function hasVapiVoice(role: VoiceRole): boolean {
   return Boolean(VAPI_PUBLIC_KEY && getVapiVoiceId(role));
+}
+
+function getVoiceSuffix(voiceId: string): string {
+  if (!voiceId) return 'none';
+  return voiceId.length <= 6 ? voiceId : `...${voiceId.slice(-6)}`;
+}
+
+function voiceDebug(event: string, payload: Record<string, unknown> = {}) {
+  if (!VAPI_DEBUG_ENABLED) return;
+  console.info(`[VOICE DEBUG] ${event}`, payload);
 }
 
 async function getVapiClient(): Promise<any> {
@@ -335,6 +355,15 @@ async function speakWithVapi(role: VoiceRole, text: string): Promise<void> {
   const voiceId = getVapiVoiceId(role);
   if (!voiceId) throw new Error(`Missing Vapi voice id for role: ${role}`);
 
+  voiceDebug('narration.start.request', {
+    role,
+    provider: VAPI_VOICE_PROVIDER,
+    modelProvider: VAPI_MODEL_PROVIDER,
+    model: VAPI_MODEL,
+    voiceId: getVoiceSuffix(voiceId),
+    textLength: text.length,
+  });
+
   const vapi = await getVapiClient();
 
   if (vapiCommandClientPromise) {
@@ -385,6 +414,12 @@ async function speakWithVapi(role: VoiceRole, text: string): Promise<void> {
     vapi.say(text, true),
     timeout(VAPI_TIMEOUT_MS, 'say'),
   ]);
+  voiceDebug('narration.say.success', {
+    role,
+    provider: VAPI_VOICE_PROVIDER,
+    voiceId: getVoiceSuffix(voiceId),
+    textLength: text.length,
+  });
 }
 
 function mapStageToPhase(stage?: BackendTrialStage | null): TrialPhase {
@@ -692,6 +727,8 @@ function buildVerdictTranscript(view: VerdictPresentation): string {
 
 export default function App() {
   const [view, setView] = useState<View>('landing');
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
   const [trialPhase, setTrialPhase] = useState<TrialPhase>('opening');
   const [isRedactMode, setIsRedactMode] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -1258,32 +1295,98 @@ export default function App() {
   const phaseIndex = TRIAL_PHASES.indexOf(trialPhase);
   const goPrev = () => handleReset();
   const goNext = () => handleNextTurn();
+  const showSidebar = view !== 'landing';
+  const hasStatusBar = Boolean(apiError || isLoading || sessionId);
+  const isDesktopSidebarHidden = isSidebarCollapsed;
+  const sidebarOffsetClass = isDesktopSidebarHidden ? 'md:ml-0' : 'md:ml-72';
+  const sidebarLeftClass = isDesktopSidebarHidden ? 'md:left-0' : 'md:left-72';
+  const contentTopPaddingClass = hasStatusBar ? 'pt-11' : '';
+  const sidebarAuxPanel = view === 'simulation' ? (
+    <div className="border border-primary/12 bg-primary/[0.03] px-3 py-3 space-y-3">
+      <div className="space-y-1">
+        <p className="text-[0.58rem] tracking-[0.32em] text-outline">AI PROCESSING</p>
+        <p className="text-[0.68rem] tracking-[0.14em] text-primary/80 normal-case">
+          {voiceCommandMessage}
+        </p>
+      </div>
+      <div className="space-y-1 border-t border-primary/10 pt-3">
+        <p className="text-[0.58rem] tracking-[0.32em] text-outline">VOICE COMMAND MODE</p>
+        <p className="text-[0.68rem] tracking-[0.14em] text-primary/80">
+          {voiceCommandStatus.toUpperCase()}
+        </p>
+        <p className="text-[0.62rem] tracking-[0.08em] text-outline normal-case">
+          Last command: {lastVoiceCommand}
+        </p>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <button
+          type="button"
+          onClick={toggleVoiceControl}
+          className={cn(
+            'px-2 py-2 text-[0.58rem] tracking-[0.22em] uppercase border transition-colors',
+            isVoiceControlEnabled
+              ? 'border-primary text-primary hover:bg-primary hover:text-background'
+              : 'border-primary/40 text-outline hover:border-primary hover:text-primary',
+          )}
+        >
+          {isVoiceControlEnabled ? 'Stop' : 'Start'}
+        </button>
+        <button
+          type="button"
+          onClick={testVoice}
+          disabled={isTestingVoice}
+          className="px-2 py-2 text-[0.58rem] tracking-[0.22em] uppercase border border-primary/40 text-outline transition-colors hover:border-primary hover:text-primary disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {isTestingVoice ? 'Testing' : 'Test'}
+        </button>
+      </div>
+    </div>
+  ) : null;
+
+  useEffect(() => {
+    setIsMobileSidebarOpen(false);
+  }, [view]);
 
   return (
     <div className="min-h-screen bg-background text-primary selection:bg-primary selection:text-background font-mono uppercase">
-      {/* TopAppBar */}
-      <header className="fixed top-0 w-full z-50 flex items-center px-6 h-16 bg-background border-b border-primary">
-
-        <div className="flex-1 flex items-center gap-4">
-          <img src="/logo.png" alt="Logo" className="w-14 h-14 object-contain invert" />
-          <h1 className="text-xl font-bold tracking-tighter font-sans">SUPREME</h1>
-        </div>
-
-        <nav className="hidden md:flex flex-none gap-8 items-center h-full">
+      {showSidebar && (
+        <>
+          {isDesktopSidebarHidden && (
+            <button
+              type="button"
+              onClick={() => setIsSidebarCollapsed(false)}
+              className="fixed left-4 top-4 z-[70] hidden h-11 w-11 items-center justify-center border border-primary/20 bg-background/90 text-primary backdrop-blur md:flex"
+              aria-label="Show navigation"
+            >
+              <PanelLeftOpen className="h-5 w-5" />
+            </button>
+          )}
           <button
-            onClick={() => setView('landing')}
-            className={cn(
-              "px-2 h-full flex items-center transition-colors duration-100 font-medium",
-              view === 'landing' ? "text-primary border-b-2 border-primary" : "text-outline hover:bg-primary hover:text-background"
-            )}
+            type="button"
+            onClick={() => setIsMobileSidebarOpen(true)}
+            className="fixed left-4 top-4 z-[70] flex h-11 w-11 items-center justify-center border border-primary/20 bg-background/90 text-primary backdrop-blur md:hidden"
+            aria-label="Open navigation"
           >
-            HOME
+            <Menu className="h-5 w-5" />
           </button>
-        </nav>
-      </header>
+          <AppSidebar
+            view={view}
+            isCollapsed={isDesktopSidebarHidden}
+            isMobileOpen={isMobileSidebarOpen}
+            sessionId={sessionId}
+            auxiliaryPanel={sidebarAuxPanel}
+            onCollapseToggle={() => setIsSidebarCollapsed((current) => !current)}
+            onMobileClose={() => setIsMobileSidebarOpen(false)}
+            onNavigate={setView}
+          />
+        </>
+      )}
 
       {(apiError || isLoading || sessionId) && (
-        <div className="fixed top-16 left-0 right-0 z-40 border-b border-primary/30 bg-background/95 backdrop-blur px-6 py-2 text-[10px] tracking-widest flex items-center justify-between gap-4">
+        <div className={cn(
+          "fixed top-0 right-0 z-40 border-b border-primary/20 bg-background/90 backdrop-blur px-6 py-2 text-[10px] tracking-widest flex items-center justify-between gap-4",
+          showSidebar ? cn("left-0", sidebarLeftClass) : "left-0"
+        )}>
           <div className="truncate">
             {apiError ? (
               <span className="text-red-400">API ERROR: {apiError}</span>
@@ -1305,7 +1408,7 @@ export default function App() {
           </motion.div>
         )}
         {view === 'config' && (
-          <motion.div key="config" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -20 }} className="w-full">
+          <motion.div key="config" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -20 }} className={cn("w-full", sidebarOffsetClass, contentTopPaddingClass)}>
             <ConfigView onStart={handleCreateCase} onResumeSession={handleResumeSession} isLoading={isLoading} />
           </motion.div>
         )}
@@ -1338,11 +1441,13 @@ export default function App() {
               setJudgeStatus={setJudgeStatus}
               submitObjection={submitObjection}
               resumeProceedings={resumeProceedings}
+              sidebarLeftClass={sidebarLeftClass}
+              topOffsetClass={contentTopPaddingClass}
             />
           </motion.div>
         )}
         {view === 'evidence' && (
-          <motion.div key="evidence" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="w-full">
+          <motion.div key="evidence" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className={cn("w-full", sidebarOffsetClass, contentTopPaddingClass)}>
             <EvidenceView
               onBack={() => setView('simulation')}
               onViewTranscript={() => setView('transcript')}
@@ -1351,7 +1456,7 @@ export default function App() {
           </motion.div>
         )}
         {view === 'transcript' && (
-          <motion.div key="transcript" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="w-full">
+          <motion.div key="transcript" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className={cn("w-full", sidebarOffsetClass, contentTopPaddingClass)}>
             <TranscriptView
               onBack={() => setView('simulation')}
               onViewEvidence={() => setView('evidence')}
@@ -1410,6 +1515,121 @@ export default function App() {
         )}
       </AnimatePresence>
     </div>
+  );
+}
+
+function AppSidebar({
+  view,
+  isCollapsed,
+  isMobileOpen,
+  sessionId,
+  auxiliaryPanel,
+  onCollapseToggle,
+  onMobileClose,
+  onNavigate,
+}: {
+  view: View;
+  isCollapsed: boolean;
+  isMobileOpen: boolean;
+  sessionId: string | null;
+  auxiliaryPanel?: React.ReactNode;
+  onCollapseToggle: () => void;
+  onMobileClose: () => void;
+  onNavigate: (nextView: View) => void;
+}) {
+  const navItems: Array<{ view: View; label: string; shortLabel: string; icon: React.ReactNode }> = [
+    { view: 'config', label: 'Case Setup', shortLabel: 'Setup', icon: <Scale className="h-4 w-4" /> },
+    { view: 'simulation', label: 'Docket', shortLabel: 'Docket', icon: <Gavel className="h-4 w-4" /> },
+    { view: 'evidence', label: 'Evidence', shortLabel: 'Evidence', icon: <FolderOpen className="h-4 w-4" /> },
+    { view: 'transcript', label: 'Transcript', shortLabel: 'Record', icon: <FileText className="h-4 w-4" /> },
+  ];
+  const panelWidthClass = isCollapsed ? 'md:w-20' : 'md:w-72';
+
+  return (
+    <>
+      <AnimatePresence>
+        {isMobileOpen && (
+          <motion.div
+            key="sidebar-backdrop"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[75] bg-black/70 md:hidden"
+            onClick={onMobileClose}
+          />
+        )}
+      </AnimatePresence>
+
+      <aside
+        className={cn(
+          "fixed inset-y-0 left-0 z-[80] flex w-[17.5rem] flex-col border-r border-primary/15 bg-[linear-gradient(180deg,rgba(18,18,18,0.98),rgba(10,10,10,0.98))] backdrop-blur transition-transform duration-300 md:w-auto",
+          panelWidthClass,
+          isMobileOpen ? "translate-x-0" : "-translate-x-full",
+          isCollapsed ? "md:-translate-x-full" : "md:translate-x-0"
+        )}
+      >
+        <div className="flex min-h-0 flex-1 flex-col">
+          <div className="flex items-start gap-3 border-b border-primary/12 px-4 py-5 md:px-5">
+            <button
+              type="button"
+              onClick={() => onNavigate('landing')}
+              className="flex min-w-0 items-center gap-3 text-left"
+            >
+              <span className="flex h-12 w-12 items-center justify-center border border-primary/20 bg-primary/5">
+                <img src="/logo.png" alt="SUPREME" className="h-8 w-8 object-contain invert" />
+              </span>
+              <span className="hidden min-w-0 md:block">
+                <span className="block font-sans text-[1.05rem] font-extrabold tracking-[0.18em]">SUPREME</span>
+                <span className="block text-[0.55rem] tracking-[0.34em] text-outline">COURT OPERATING SYSTEM</span>
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onMobileClose}
+              className="ml-auto flex h-10 w-10 items-center justify-center border border-primary/15 text-outline md:hidden"
+              aria-label="Close navigation"
+            >
+              <X className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={onCollapseToggle}
+              className="ml-auto hidden h-10 w-10 items-center justify-center border border-primary/15 text-outline transition-colors hover:border-primary hover:text-primary md:flex"
+              aria-label={isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            >
+              {isCollapsed ? <PanelLeftOpen className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}
+            </button>
+          </div>
+
+          <div className="hidden border-b border-primary/10 px-5 py-4 md:block">
+            <p className="text-[0.58rem] tracking-[0.34em] text-outline">Navigate the case workflow without the old title bar overhead.</p>
+          </div>
+
+          <nav className="flex flex-col gap-2 px-3 py-4">
+            {navItems.map((item) => (
+              <SideLink
+                key={item.view}
+                icon={item.icon}
+                label={item.label}
+                active={view === item.view}
+                onClick={() => onNavigate(item.view)}
+              />
+            ))}
+          </nav>
+
+          <div className="mt-auto border-t border-primary/12 px-4 py-5 md:px-5 space-y-3">
+            {auxiliaryPanel}
+            <div className="border border-primary/12 bg-primary/[0.03] px-3 py-3">
+              <p className="text-[0.58rem] tracking-[0.32em] text-outline">CURRENT SESSION</p>
+              <p className="mt-2 break-all text-[0.68rem] tracking-[0.22em] text-primary/80">
+                {sessionId ? `${sessionId.slice(0, 18)}...` : 'NOT ASSIGNED'}
+              </p>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </>
   );
 }
 
@@ -1485,31 +1705,10 @@ function EvidenceView({
   );
 
   return (
-    <main className="flex min-h-screen pt-16 bg-background">
-      {/* Sidebar */}
-      <aside className="hidden md:flex flex-none w-64 flex-col bg-background border-r border-primary fixed top-16 bottom-0 left-0">
-        <div className="p-6 border-b border-primary">
-          <h2 className="text-lg font-bold font-sans">Court Management</h2>
-          <p className="text-[10px] text-outline uppercase">Evidence Workspace</p>
-        </div>
-        <nav className="flex-grow">
-          <SideLink icon={<Gavel className="w-4 h-4" />} label="DOCKET" onClick={onBack} />
-          <SideLink icon={<FolderOpen className="w-4 h-4" />} label="EVIDENCE" active />
-          <SideLink icon={<FileText className="w-4 h-4" />} label="TRANSCRIPT" onClick={onViewTranscript} />
-        </nav>
-        <div className="p-6 border-t border-primary mt-auto">
-          <div className="space-y-1">
-            <div className="flex items-center gap-2 text-[10px] text-outline"><span className="w-2 h-2 bg-white inline-block" /> Prosecution</div>
-            <div className="flex items-center gap-2 text-[10px] text-outline"><span className="w-2 h-2 bg-[#6b7280] inline-block" /> Defense</div>
-            <div className="flex items-center gap-2 text-[10px] text-outline"><span className="w-2 h-2 bg-[#d4af37] inline-block" /> Court</div>
-          </div>
-        </div>
-      </aside>
-
-      {/* Main Content */}
-      <div className="flex-1 md:ml-64 flex flex-col min-h-0">
+    <main className="flex min-h-screen bg-background">
+      <div className="flex-1 flex flex-col min-h-0">
         {/* Page Header */}
-        <div className="px-10 py-8 border-b border-primary flex flex-col md:flex-row md:items-end justify-between gap-4">
+        <div className="px-6 py-8 md:px-10 border-b border-primary/15 flex flex-col md:flex-row md:items-end justify-between gap-4">
           <div>
             <h1 className="text-4xl font-extrabold font-sans tracking-tighter mb-1">EVIDENCE REGISTER</h1>
             <p className="text-[10px] text-outline tracking-widest uppercase">{filtered.length} of {records.length} Records — Current Session</p>
@@ -1533,7 +1732,7 @@ function EvidenceView({
         </div>
 
         {/* Type Filter Strip */}
-        <div className="px-10 py-3 border-b border-primary/30 flex gap-4 items-center flex-wrap">
+        <div className="px-6 py-3 md:px-10 border-b border-primary/20 flex gap-4 items-center flex-wrap">
           <Filter className="w-3 h-3 text-outline" />
           <span className="text-[9px] text-outline tracking-widest">TYPE:</span>
           {(['all', 'document', 'image', 'video', 'testimony', 'physical'] as const).map(t => (
@@ -1551,7 +1750,7 @@ function EvidenceView({
         </div>
 
         {/* Evidence Table */}
-        <div className="flex-1 px-10 py-6 space-y-3 overflow-y-auto">
+        <div className="flex-1 px-6 py-6 md:px-10 space-y-3 overflow-y-auto">
           {filtered.length === 0 && (
             <div className="py-20 text-center text-outline text-sm tracking-widest">No evidence matches the current filter.</div>
           )}
@@ -1615,7 +1814,7 @@ function EvidenceView({
 function LandingView({ onStart }: { onStart: () => void }) {
 
   return (
-    <main className="min-h-screen flex flex-col items-center justify-center pt-16 relative overflow-hidden">
+    <main className="min-h-screen flex flex-col items-center justify-center relative overflow-hidden">
       <div className="absolute -inset-x-[14%] -inset-y-[10%] opacity-95 pointer-events-none">
         <Beams
           beamWidth={4.2}
@@ -1745,25 +1944,8 @@ function ConfigView({
   };
 
   return (
-    <main className="md:ml-64 pt-16 min-h-screen pb-24 relative">
+    <main className="min-h-screen pb-24 relative">
       <div className="absolute inset-0 dossier-grid opacity-10 pointer-events-none" />
-
-      {/* SideNavBar */}
-      <aside className="fixed left-0 top-16 h-[calc(100vh-64px)] w-64 flex flex-col bg-background border-r border-primary hidden md:flex">
-        <div className="p-6 border-b border-primary">
-          <div className="text-lg font-bold font-sans">Court Management</div>
-          <div className="text-[10px] text-outline mt-1 tracking-widest uppercase">Case Setup</div>
-        </div>
-        <nav className="flex-1 py-4">
-          <SideLink icon={<Gavel className="w-4 h-4" />} label="DOCKET" active />
-          <SideLink icon={<FolderOpen className="w-4 h-4" />} label="EVIDENCE" />
-          <SideLink icon={<FileText className="w-4 h-4" />} label="TRANSCRIPT" />
-        </nav>
-        <div className="p-6 mt-auto border-t border-primary/20">
-          <div className="text-[10px] text-outline mb-2 uppercase">Session ID</div>
-          <div className="text-[10px] break-all opacity-50 font-mono">Assigned after case creation</div>
-        </div>
-      </aside>
 
       <div className="max-w-4xl mx-auto px-6 py-12 relative z-10">
         <div className="mb-12 flex flex-col md:flex-row md:items-end justify-between border-b border-primary pb-8 gap-4">
@@ -2009,14 +2191,27 @@ function ConfigView({
   );
 }
 
-function SideLink({ icon, label, active, onClick }: { icon: React.ReactNode, label: string, active?: boolean, onClick?: () => void }) {
+function SideLink({
+  icon,
+  label,
+  active,
+  compact,
+  onClick,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  active?: boolean;
+  compact?: boolean;
+  onClick?: () => void;
+}) {
   return (
     <a className={cn(
-      "flex items-center px-6 py-4 gap-4 transition-colors duration-100 font-bold text-xs tracking-widest cursor-pointer",
-      active ? "bg-primary text-background" : "text-outline hover:text-primary hover:bg-surface-container"
+      "flex items-center px-6 py-4 gap-4 transition-colors duration-100 font-bold text-xs tracking-[0.24em] cursor-pointer border border-transparent",
+      compact ? "justify-center px-2" : "justify-start",
+      active ? "border-primary/15 bg-primary text-background" : "text-outline hover:border-primary/10 hover:text-primary hover:bg-surface-container-lowest"
     )} onClick={(e) => { e.preventDefault(); onClick?.(); }} href="#">
       {icon}
-      {label}
+      {!compact && label}
     </a>
   );
 }
@@ -2072,6 +2267,8 @@ function SimulationView({
   judgeRulingAnalysis,
   judgeRulingEffect,
   judgeStatus,
+  sidebarLeftClass,
+  topOffsetClass,
   setJudgeStatus,
   submitObjection,
   resumeProceedings,
@@ -2099,6 +2296,8 @@ function SimulationView({
   judgeRulingAnalysis: string;
   judgeRulingEffect: string;
   judgeStatus: 'LISTENING' | 'EVALUATING' | 'RULING' | 'HALTED';
+  sidebarLeftClass: string;
+  topOffsetClass: string;
   setJudgeStatus: (v: 'LISTENING' | 'EVALUATING' | 'RULING' | 'HALTED') => void;
   submitObjection: () => void;
   resumeProceedings: () => void;
@@ -2302,15 +2501,26 @@ function SimulationView({
           if (cancelled) return;
           setSpeechState({
             status: 'idle',
-            message: `${formatAgent(counselRole)} delivered via Vapi voice.`,
+            message: `${formatAgent(counselRole)} delivered via Vapi (${VAPI_VOICE_PROVIDER}, ${getVoiceSuffix(getVapiVoiceId(counselRole))}).`,
             agent: counselRole,
           });
           return;
         } catch (error) {
           vapiFallbackErrorRef.current = parseError(error);
+          voiceDebug('narration.vapi.error', {
+            role: counselRole,
+            provider: VAPI_VOICE_PROVIDER,
+            voiceId: getVoiceSuffix(getVapiVoiceId(counselRole)),
+            error: vapiFallbackErrorRef.current,
+          });
         }
       }
 
+      voiceDebug('narration.browser.fallback', {
+        role: counselRole,
+        provider: 'browser-tts',
+        reason: vapiFallbackErrorRef.current || 'Vapi key/voice missing for role',
+      });
       speakWithBrowserFallback();
     };
 
@@ -2350,12 +2560,13 @@ function SimulationView({
 
   return (
     <div
-      className="fixed inset-0 top-16 bottom-20 overflow-hidden"
+      className={cn("fixed inset-0 bottom-20 overflow-hidden", topOffsetClass)}
       style={{ cursor: isRedactMode ? 'crosshair' : undefined }}
     >
       {/* Judge Status Banner */}
       <div className={cn(
-        "absolute top-0 left-0 md:left-64 right-0 h-8 flex items-center px-6 gap-3 z-30 border-b border-primary/30 font-mono text-[9px] tracking-[0.3em] uppercase transition-colors duration-300",
+        "absolute top-0 left-0 right-0 h-8 flex items-center px-6 gap-3 z-30 border-b border-primary/30 font-mono text-[9px] tracking-[0.3em] uppercase transition-colors duration-300",
+        sidebarLeftClass,
         judgeStatus === 'LISTENING' && "bg-background",
         judgeStatus === 'HALTED' && "bg-primary/10",
         judgeStatus === 'EVALUATING' && "bg-primary/5",
@@ -2377,7 +2588,7 @@ function SimulationView({
       </div>
 
       {/* SideNavBar - true fixed */}
-      <aside className="absolute left-0 top-0 bottom-0 w-64 flex flex-col bg-background border-r border-primary hidden md:flex">
+      <aside className="hidden">
         <div className="p-6 border-b border-primary">
           <h2 className="text-lg font-bold font-sans">Court Management</h2>
           <p className="text-[10px] text-outline uppercase">Live Session</p>
@@ -2427,7 +2638,7 @@ function SimulationView({
       </aside>
 
       {/* Simulation Split View OR Verdict Screen */}
-      <div className="absolute top-8 right-0 bottom-0 left-0 md:left-64">
+      <div className={cn("absolute top-8 right-0 bottom-0 left-0", sidebarLeftClass)}>
         <AnimatePresence mode="wait">
           {trialPhase !== 'verdict' ? (
             <motion.div
@@ -2497,7 +2708,7 @@ function SimulationView({
       </div>
 
       {/* Judge HUD */}
-      <div className="fixed bottom-20 left-0 md:left-64 right-0 h-16 bg-background border-t border-primary z-40 flex items-stretch divide-x divide-primary/30">
+      <div className={cn("fixed bottom-20 left-0 right-0 h-16 bg-background border-t border-primary z-40 flex items-stretch divide-x divide-primary/30", sidebarLeftClass)}>
 
         {/* 1. Verdict Lean */}
         <div className="flex-1 flex flex-col justify-center px-5 gap-1 min-w-0 relative overflow-hidden">
@@ -2707,10 +2918,10 @@ function TranscriptView({
   }, []);
 
   return (
-    <main className="flex min-h-screen pt-16 bg-background">
+    <main className="flex min-h-screen bg-background">
 
       {/* Sidebar */}
-      <aside className="hidden md:flex flex-none w-64 flex-col bg-background border-r border-primary fixed top-16 bottom-0 left-0">
+      <aside className="hidden">
         <div className="p-6 border-b border-primary">
           <h2 className="text-lg font-bold font-sans">Court Management</h2>
           <p className="text-[10px] text-outline uppercase">Transcript Review</p>
@@ -2727,7 +2938,7 @@ function TranscriptView({
       </aside>
 
       {/* Main content */}
-      <div className="flex-1 md:ml-64 overflow-y-auto pb-8">
+      <div className="flex-1 overflow-y-auto pb-8">
         <div className="max-w-4xl mx-auto px-6 py-8 space-y-0">
 
           <div className="border border-primary/30 mb-8 px-6 py-5 font-mono text-[11px] space-y-2">
