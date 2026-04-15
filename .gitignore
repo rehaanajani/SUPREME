@@ -8,6 +8,7 @@ venv/
 env/
 .env
 *.log
+supreme-backend/data/sessions.db
 
 # ── Node / Frontend ───────────────────────────────────────────────────────────
 node_modules/

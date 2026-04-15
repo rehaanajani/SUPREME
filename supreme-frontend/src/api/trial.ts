@@ -50,3 +50,15 @@ export function resetTrial(sessionId: string): Promise<CreateCaseResponse> {
     method: 'POST',
   });
 }
+
+export interface SessionListItem {
+  session_id: string;
+  title: string;
+  stage: string;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export function listSessions(): Promise<SessionListItem[]> {
+  return request<SessionListItem[]>('/api/sessions');
+}

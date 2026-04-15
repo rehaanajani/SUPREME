@@ -11,12 +11,20 @@ import uuid
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from redis.exceptions import AuthenticationError as RedisAuthenticationError
-from redis.exceptions import ConnectionError as RedisConnectionError
+
+try:
+    from redis.exceptions import AuthenticationError as RedisAuthenticationError
+    from redis.exceptions import ConnectionError as RedisConnectionError
+except Exception:  # pragma: no cover - redis dependency is optional at runtime
+    class RedisAuthenticationError(Exception):
+        pass
+
+    class RedisConnectionError(Exception):
+        pass
 
 from app.models.session_store import session_store
 from app.routes.api import router
-from config import APP_HOST, APP_PORT, APP_LOG_LEVEL, CORS_ORIGINS, DEMO_MODE
+from config import APP_HOST, APP_PORT, APP_LOG_LEVEL, CORS_ORIGINS, DEMO_MODE, SESSION_BACKEND
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -30,7 +38,7 @@ app = FastAPI(
     title="SUPREME — AI Courtroom Simulator",
     description=(
         "Multi-agent courtroom simulation: Prosecution vs Defense vs Judge. "
-        "Powered by OpenRouter (free models) + Qdrant RAG + Redis session state."
+        "Powered by OpenRouter (free models) + Qdrant RAG + persistent session state."
     ),
     version="1.0.0",
     docs_url="/docs",
@@ -95,13 +103,18 @@ async def root():
 @app.on_event("startup")
 async def on_startup():
     mode = "DEMO" if DEMO_MODE else "PRODUCTION"
-    logger.info("SUPREME Courtroom Simulator starting — mode: %s log_level=%s", mode, APP_LOG_LEVEL)
+    logger.info(
+        "SUPREME Courtroom Simulator starting — mode: %s log_level=%s session_backend=%s",
+        mode,
+        APP_LOG_LEVEL,
+        SESSION_BACKEND,
+    )
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
     await session_store.close()
-    logger.info("Redis connection closed.")
+    logger.info("Session store closed.")
 
 
 # ── Global error handler ─────────────────────────────────────────────────────

@@ -4,9 +4,11 @@ Central configuration loaded from environment variables.
 """
 
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+_ENV_PATH = Path(__file__).resolve().with_name(".env")
+load_dotenv(dotenv_path=_ENV_PATH)
 
 # ── OpenRouter (LLM) ──────────────────────────────────────────────────────────
 OPENROUTER_API_KEY: str  = os.getenv("OPENROUTER_API_KEY", "")
@@ -21,19 +23,54 @@ LLM_MAX_TOKENS: int   = 300
 LLM_TIMEOUT:    float = 15.0
 LLM_RETRIES:    int   = 2
 
-# ── OpenAI (embeddings, optional) ────────────────────────────────────────────
-OPENAI_API_KEY:   str = os.getenv("OPENAI_API_KEY", "")
-EMBEDDING_MODEL:  str = "text-embedding-3-small"
+# ── Embeddings (optional) ─────────────────────────────────────────────────────
+# Provider: auto | openai | nvidia
+EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", "auto").strip().lower()
+
+OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+
+NVIDIA_API_KEY: str = os.getenv("NVIDIA_API_KEY", "")
+NVIDIA_BASE_URL: str = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+
+
+def _default_embedding_model() -> str:
+    if EMBEDDING_PROVIDER == "nvidia":
+        return "nvidia/nv-embedqa-e5-v5"
+    if EMBEDDING_PROVIDER == "openai":
+        return "text-embedding-3-small"
+    if OPENAI_API_KEY:
+        return "text-embedding-3-small"
+    if NVIDIA_API_KEY:
+        return "nvidia/nv-embedqa-e5-v5"
+    return "text-embedding-3-small"
+
+
+EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", _default_embedding_model())
 
 # ── Qdrant ────────────────────────────────────────────────────────────────────
 QDRANT_URL:         str = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY:     str = os.getenv("QDRANT_API_KEY", "")    # required for Qdrant Cloud
 QDRANT_COLLECTION:  str = os.getenv("QDRANT_COLLECTION", "ecourt_precedents")
-QDRANT_VECTOR_SIZE: int = 1536  # matches text-embedding-3-small
+QDRANT_VECTOR_SIZE: int = int(
+    os.getenv(
+        "QDRANT_VECTOR_SIZE",
+        "1024" if EMBEDDING_MODEL == "nvidia/nv-embedqa-e5-v5" else "1536",
+    )
+)
 
-# ── Redis ─────────────────────────────────────────────────────────────────────
-REDIS_URL:   str = os.getenv("REDIS_URL", "redis://localhost:6379")
-SESSION_TTL: int = 86_400  # 24 hours in seconds
+# ── Session store ─────────────────────────────────────────────────────────────
+# SESSION_BACKEND: sqlite | redis | memory
+SESSION_BACKEND: str = os.getenv("SESSION_BACKEND", "sqlite").strip().lower()
+SESSION_TTL: int = int(os.getenv("SESSION_TTL", "86400"))  # 24 hours in seconds
+
+# SQLite backend (default)
+SESSION_SQLITE_PATH: str = os.getenv(
+    "SESSION_SQLITE_PATH",
+    str(Path(__file__).resolve().parent / "data" / "sessions.db"),
+)
+
+# Redis backend (optional)
+REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 # ── Application ───────────────────────────────────────────────────────────────
 APP_HOST:   str  = os.getenv("APP_HOST", "0.0.0.0")
@@ -52,10 +89,3 @@ VAPI_PROSECUTOR_VOICE:  str  = os.getenv("VAPI_PROSECUTOR_VOICE", "")   # e.g. E
 VAPI_DEFENSE_VOICE:     str  = os.getenv("VAPI_DEFENSE_VOICE", "")
 VAPI_JUDGE_VOICE:       str  = os.getenv("VAPI_JUDGE_VOICE", "")
 VAPI_ENABLED:           bool = bool(VAPI_API_KEY)
-
-# ── Trial defaults ────────────────────────────────────────────────────────────
-TURNS_PER_STAGE: dict[str, int] = {
-    "easy":   1,
-    "medium": 2,
-    "hard":   3,
-}

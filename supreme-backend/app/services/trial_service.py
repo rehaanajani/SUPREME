@@ -27,14 +27,12 @@ from app.models.trial import (
     ControlResponse,
     CreateCaseRequest,
     CreateCaseResponse,
-    Difficulty,
     NextTurnResponse,
     TranscriptEntry,
     TrialState,
     TrialStage,
     VerdictResponse,
 )
-from config import TURNS_PER_STAGE
 from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
@@ -58,19 +56,15 @@ async def _save(state: TrialState) -> None:
 
 async def create_case(req: CreateCaseRequest) -> CreateCaseResponse:
     """Initialise a new trial session and persist it."""
-    difficulty = req.difficulty or Difficulty.MEDIUM
-    turns = TURNS_PER_STAGE.get(difficulty.value if hasattr(difficulty, "value") else difficulty, 2)
-
     case = CaseDetails(
         case_id=f"CASE-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
         title=req.title,
         description=req.description,
         charges=req.charges,
         evidence=req.evidence,
-        difficulty=difficulty,
     )
 
-    state = TrialState(case=case, turns_per_stage=turns)
+    state = TrialState(case=case)
     await session_store.save(state)
 
     logger.info("Created trial session %s — %s", state.session_id, case.title)
@@ -110,10 +104,12 @@ async def next_turn(session_id: str) -> NextTurnResponse:
 async def control(session_id: str, req: ControlRequest) -> ControlResponse:
     """Apply a user control action (objection / redact / inject)."""
     state = await _load_or_404(session_id)
+    objection_ruling = None
 
     if req.action == ControlAction.OBJECTION:
-        state = await handle_objection(state, req.payload)
-        result = "Objection noted and recorded in the transcript."
+        state, objection_ruling = await handle_objection(state, req.payload)
+        ruling_label = objection_ruling.ruling if objection_ruling else "NOTED"
+        result = f"Objection {ruling_label}. {objection_ruling.reason if objection_ruling else ''}"
 
     elif req.action == ControlAction.REDACT:
         if not req.payload:
@@ -136,6 +132,7 @@ async def control(session_id: str, req: ControlRequest) -> ControlResponse:
         action=req.action,
         result=result,
         state=state.model_dump(),
+        objection_ruling=objection_ruling,
     )
 
 
@@ -169,7 +166,6 @@ async def reset_trial(session_id: str) -> CreateCaseResponse:
     new_state = TrialState(
         session_id=session_id,   # reuse the same session ID
         case=case,
-        turns_per_stage=state.turns_per_stage,
     )
     await session_store.save(new_state)
 

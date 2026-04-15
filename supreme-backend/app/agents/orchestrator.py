@@ -20,12 +20,13 @@ from datetime import datetime
 from app.agents.runners import run_defense, run_judge, run_prosecution
 from app.models.trial import (
     AgentRole,
+    ObjectionRuling,
     TranscriptEntry,
     TrialStage,
     TrialState,
     Verdict,
 )
-from config import DEMO_MODE, TURNS_PER_STAGE
+from app.tools.llm import generate_response_with_trace
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +57,9 @@ STAGE_AGENT: dict[TrialStage, AgentRole] = {
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _turns_for_state(state: TrialState) -> int:
-    """Return number of turns per stage, capped to 1 in DEMO_MODE."""
-    if DEMO_MODE:
-        return 1
-    return state.turns_per_stage
+def _turns_for_state(_state: TrialState) -> int:
+    """Return number of turns per stage."""
+    return 1
 
 
 def _next_stage(current: TrialStage) -> TrialStage:
@@ -168,10 +167,12 @@ async def fast_forward(state: TrialState) -> tuple[TrialState, TranscriptEntry]:
 
 # ── User control actions ──────────────────────────────────────────────────────
 
-async def handle_objection(state: TrialState, payload: str | None) -> TrialState:
+async def handle_objection(state: TrialState, payload: str | None) -> tuple[TrialState, ObjectionRuling]:
     """
-    Insert an OBJECTION entry into the transcript.
-    The objection is attributed to whichever agent is NOT currently speaking.
+    Insert an OBJECTION entry into the transcript, then ask an LLM judge
+    to adjudicate the objection.  Returns the updated state **and** the ruling.
+
+    If SUSTAINED, the last non-objection entry is marked as redacted.
     """
     objecting_agent = (
         AgentRole.DEFENSE
@@ -187,7 +188,83 @@ async def handle_objection(state: TrialState, payload: str | None) -> TrialState
     )
     state.transcript.append(entry)
     state.updated_at = datetime.utcnow()
-    return state
+
+    # ── Find the last non-objection statement to evaluate against ─────
+    last_statement = None
+    for te in reversed(state.transcript):
+        if not te.content.startswith("OBJECTION:") and not te.redacted:
+            last_statement = te
+            break
+
+    context_text = last_statement.content if last_statement else "No prior statement."
+
+    # ── Ask LLM judge to rule on the objection ───────────────────────
+    judge_system = (
+        "You are the Presiding Judge in a courtroom trial. "
+        "An attorney has raised an objection.  You must decide whether it is "
+        "SUSTAINED (the objection is valid — the challenged statement is struck) or "
+        "OVERRULED (the objection is invalid — the statement stands).\n\n"
+        "Rules:\n"
+        "- Evaluate the objection grounds against standard rules of evidence.\n"
+        "- Respond with exactly one line starting with SUSTAINED or OVERRULED, "
+        "followed by a brief reason (1-2 sentences).\n"
+        "- Be authoritative and decisive.\n"
+    )
+    judge_prompt = (
+        f"CHALLENGED STATEMENT ({last_statement.agent.upper() if last_statement else 'unknown'}):\n"
+        f"{context_text}\n\n"
+        f"OBJECTION RAISED BY {objecting_agent.upper()}:\n"
+        f"{objection_text}\n\n"
+        "Deliver your ruling. Start with SUSTAINED or OVERRULED."
+    )
+
+    try:
+        raw_ruling, _ = await generate_response_with_trace(
+            system_prompt=judge_system,
+            user_prompt=judge_prompt,
+        )
+    except Exception as exc:
+        logger.warning("LLM objection ruling failed: %s — defaulting to OVERRULED.", exc)
+        raw_ruling = "OVERRULED. The court cannot evaluate this objection at this time."
+
+    # ── Parse ruling ─────────────────────────────────────────────────
+    raw_upper = raw_ruling.strip().upper()
+    if raw_upper.startswith("SUSTAINED"):
+        ruling_decision = "SUSTAINED"
+    else:
+        ruling_decision = "OVERRULED"
+
+    # Extract reason: everything after the first word
+    reason_text = raw_ruling.strip()
+    first_dot = reason_text.find(".")
+    if first_dot != -1 and first_dot < len(reason_text) - 1:
+        reason_text = reason_text[first_dot + 1:].strip()
+    elif " " in reason_text:
+        reason_text = reason_text.split(" ", 1)[1].strip()
+
+    # If sustained, redact the challenged statement
+    if ruling_decision == "SUSTAINED" and last_statement:
+        last_statement.redacted = True
+        logger.info("Objection SUSTAINED — redacted entry %s.", last_statement.id)
+
+    ruling = ObjectionRuling(
+        ruling=ruling_decision,
+        reason=reason_text or "The court has ruled.",
+        timestamp=datetime.utcnow(),
+    )
+
+    # Add the ruling to transcript as well
+    ruling_entry = TranscriptEntry(
+        agent=AgentRole.JUDGE,
+        stage=state.stage,
+        content=f"RULING: {ruling_decision}. {ruling.reason}",
+        timestamp=datetime.utcnow(),
+    )
+    state.transcript.append(ruling_entry)
+    state.updated_at = datetime.utcnow()
+
+    logger.info("Objection ruling: %s — %s", ruling_decision, ruling.reason)
+    return state, ruling
 
 
 async def handle_redact(state: TrialState, payload: str | None) -> TrialState:

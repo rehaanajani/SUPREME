@@ -60,12 +60,16 @@ function joinUrl(path: string): string {
   return `${API_BASE_URL}${normalizedPath}`;
 }
 
-export async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export async function request<T>(path: string, init?: RequestInit & { timeoutMs?: number }): Promise<T> {
   const url = joinUrl(path);
   const method = init?.method || 'GET';
   const startedAt = performance.now();
   logApiDebug('request:start', { method, url, path });
   let response: Response;
+
+  const timeoutMs = init?.timeoutMs ?? 30_000;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     response = await fetch(url, {
@@ -74,9 +78,22 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
         ...(init?.headers || {}),
       },
       ...init,
+      signal: controller.signal,
     });
   } catch (error) {
+    clearTimeout(timeoutId);
     const latencyMs = Math.round(performance.now() - startedAt);
+
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      logApiDebug('request:timeout', { method, url, latencyMs, timeoutMs });
+      throw new ApiError(
+        `Request to ${method} ${url} timed out after ${Math.round(timeoutMs / 1000)}s. Is the backend running?`,
+        0,
+        error,
+        { code: 'REQUEST_TIMEOUT' },
+      );
+    }
+
     logApiDebug('request:network_error', { method, url, latencyMs, error });
     console.error('API network failure', { method, url, error });
     throw new ApiError(
@@ -86,6 +103,8 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
       { code: 'NETWORK_ERROR' },
     );
   }
+
+  clearTimeout(timeoutId);
 
   const contentType = response.headers.get('content-type') || '';
   const isJson = contentType.includes('application/json');

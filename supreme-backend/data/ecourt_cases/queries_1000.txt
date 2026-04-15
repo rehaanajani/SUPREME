@@ -1,0 +1,108 @@
+# Criminal law
+murder
+culpable homicide
+attempt to murder
+dowry death
+rape
+gang rape
+sexual harassment
+acid attack
+domestic violence
+kidnapping
+abduction
+human trafficking
+criminal conspiracy
+rioting
+unlawful assembly
+terrorism
+sedition
+forgery
+counterfeit
+criminal breach of trust
+cheating
+cyber crime
+money laundering
+narcotic drugs
+arms act
+
+# Procedure / evidence
+bail
+anticipatory bail
+quashing FIR
+discharge application
+framing of charge
+section 161 statement
+section 164 statement
+electronic evidence
+dying declaration
+test identification parade
+chain of custody
+
+# Constitutional / administrative
+article 14
+article 19
+article 21
+habeas corpus
+writ petition
+natural justice
+public interest litigation
+reservation in promotion
+service matter
+administrative law
+
+# Civil / commercial
+specific performance
+injunction
+declaration suit
+partition suit
+adverse possession
+easement
+land acquisition
+tenant eviction
+rent control
+property dispute
+intellectual property
+trademark infringement
+copyright infringement
+patent infringement
+arbitration award
+contract breach
+consumer protection
+insolvency and bankruptcy
+company law oppression
+
+# Tax / financial
+income tax reassessment
+GST input tax credit
+customs duty
+excise duty
+bank fraud
+dishonour cheque
+section 138 ni act
+
+# Family law
+divorce cruelty
+divorce desertion
+child custody
+maintenance under section 125
+guardianship
+adoption
+succession certificate
+probate
+
+# Labour / social
+industrial dispute
+wrongful termination
+minimum wages
+workmen compensation
+epf dispute
+
+# Misc high-frequency litigation
+motor accident compensation
+medical negligence
+defamation
+contempt of court
+election petition
+environmental clearance
+forest rights
+electricity theft

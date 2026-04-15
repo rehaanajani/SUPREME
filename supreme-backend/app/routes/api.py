@@ -11,6 +11,7 @@ from app.models.trial import (
     ControlRequest,
     CreateCaseRequest,
 )
+from app.models.session_store import session_store, session_store_diagnostics
 from app.services import trial_service
 from app.tools.rag import rag_diagnostics
 
@@ -30,7 +31,19 @@ async def debug_rag():
     return rag_diagnostics()
 
 
+@router.get("/api/debug/session-store", tags=["debug"])
+async def debug_session_store():
+    """Inspect current session-store backend and health."""
+    return await session_store_diagnostics()
+
+
 # ── Case / Session ─────────────────────────────────────────────────────────────
+
+@router.get("/api/sessions", tags=["trial"])
+async def list_sessions():
+    """List all saved sessions (id, title, stage, timestamps)."""
+    return await session_store.list_all()
+
 
 @router.post("/api/case", tags=["trial"])
 async def create_case(req: CreateCaseRequest):

@@ -1,5 +1,3 @@
-export type Difficulty = 'easy' | 'medium' | 'hard';
-
 export type AgentRole = 'prosecution' | 'defense' | 'judge';
 
 export type TrialStage =
@@ -53,7 +51,6 @@ export interface CaseDetails {
   description: string;
   charges: string[];
   evidence: string[];
-  difficulty: Difficulty;
 }
 
 export interface Verdict {
@@ -61,6 +58,12 @@ export interface Verdict {
   reasoning: string;
   key_factors: string[];
   confidence: number;
+}
+
+export interface ObjectionRuling {
+  ruling: 'SUSTAINED' | 'OVERRULED';
+  reason: string;
+  timestamp: string;
 }
 
 export interface TrialState {
@@ -71,7 +74,6 @@ export interface TrialState {
   transcript: TranscriptEntry[];
   verdict: Verdict | null;
   stage_turn: number;
-  turns_per_stage: number;
   created_at: string;
   updated_at: string;
 }
@@ -81,7 +83,6 @@ export interface CreateCaseRequest {
   description: string;
   charges: string[];
   evidence: string[];
-  difficulty?: Difficulty;
 }
 
 export interface CreateCaseResponse {
@@ -108,6 +109,7 @@ export interface ControlResponse {
   action: ControlAction;
   result: string;
   state: TrialState;
+  objection_ruling?: ObjectionRuling | null;
 }
 
 export interface VerdictResponse {

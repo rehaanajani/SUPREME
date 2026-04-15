@@ -30,12 +30,6 @@ class AgentRole(str, Enum):
     JUDGE       = "judge"
 
 
-class Difficulty(str, Enum):
-    EASY   = "easy"
-    MEDIUM = "medium"
-    HARD   = "hard"
-
-
 class ControlAction(str, Enum):
     OBJECTION        = "objection"
     REDACT           = "redact"
@@ -83,7 +77,12 @@ class CaseDetails(BaseModel):
     description: str
     charges: list[str]
     evidence: list[str]
-    difficulty: Difficulty = Difficulty.MEDIUM
+
+
+class ObjectionRuling(BaseModel):
+    ruling: str                      # "SUSTAINED" | "OVERRULED"
+    reason: str                      # LLM-generated reasoning
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 
 class Verdict(BaseModel):
@@ -107,7 +106,6 @@ class TrialState(BaseModel):
 
     # Turn tracking within the current stage
     stage_turn: int = 0            # how many turns taken in this stage
-    turns_per_stage: int = 1       # set from difficulty
 
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
@@ -123,7 +121,6 @@ class CreateCaseRequest(BaseModel):
     description: str
     charges: list[str]
     evidence: list[str]
-    difficulty: Difficulty = Difficulty.MEDIUM
 
 
 class CreateCaseResponse(BaseModel):
@@ -142,6 +139,7 @@ class ControlResponse(BaseModel):
     action: ControlAction
     result: str
     state: Any                       # serialised TrialState snapshot
+    objection_ruling: Optional[ObjectionRuling] = None
 
 
 class NextTurnResponse(BaseModel):

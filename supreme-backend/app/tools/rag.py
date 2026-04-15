@@ -2,7 +2,7 @@
 app/tools/rag.py — Retrieval-Augmented Generation via Qdrant.
 
 Two modes:
-  1. Semantic search  — when OPENAI_API_KEY is set (uses text-embedding-3-small)
+  1. Semantic search  — when an embedding provider key is set
   2. Keyword fallback — simple substring scan over stored payloads
 
 Filter by role:
@@ -16,7 +16,10 @@ import logging
 from typing import Any
 
 from config import (
+    EMBEDDING_PROVIDER,
     OPENAI_API_KEY,
+    NVIDIA_API_KEY,
+    NVIDIA_BASE_URL,
     QDRANT_URL,
     QDRANT_API_KEY,
     QDRANT_COLLECTION,
@@ -33,7 +36,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _qdrant_client: Any = None
-_openai_client: Any = None
+_embedding_client: Any = None
+_embedding_client_provider: str | None = None
 
 
 def _debug(event: str, **kwargs: Any) -> None:
@@ -59,17 +63,52 @@ def _get_qdrant():
     return _qdrant_client
 
 
-def _get_openai():
-    global _openai_client
-    if _openai_client is None and OPENAI_API_KEY:
+def _resolve_embedding_config() -> tuple[str | None, str, str | None]:
+    """Resolve embedding provider/auth based on env config."""
+    provider = EMBEDDING_PROVIDER
+
+    if provider == "openai":
+        return "openai", OPENAI_API_KEY, None
+    if provider == "nvidia":
+        return "nvidia", NVIDIA_API_KEY, NVIDIA_BASE_URL
+
+    # auto mode
+    if OPENAI_API_KEY:
+        return "openai", OPENAI_API_KEY, None
+    if NVIDIA_API_KEY:
+        return "nvidia", NVIDIA_API_KEY, NVIDIA_BASE_URL
+    return None, "", None
+
+
+def _get_embedding_client():
+    global _embedding_client, _embedding_client_provider
+    if _embedding_client is None:
+        provider, api_key, base_url = _resolve_embedding_config()
+        if not provider or not api_key:
+            _debug(
+                "embedding_client_skipped_no_key",
+                configured_provider=EMBEDDING_PROVIDER,
+            )
+            return None
         try:
             from openai import AsyncOpenAI
-            _openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-            _debug("openai_client_init_ok", embedding_model=EMBEDDING_MODEL)
+
+            kwargs: dict[str, Any] = {"api_key": api_key}
+            if base_url:
+                kwargs["base_url"] = base_url
+
+            _embedding_client = AsyncOpenAI(**kwargs)
+            _embedding_client_provider = provider
+            _debug(
+                "embedding_client_init_ok",
+                provider=provider,
+                embedding_model=EMBEDDING_MODEL,
+                base_url=(base_url or "openai-default"),
+            )
         except Exception as exc:
-            logger.warning("OpenAI client init failed: %s", exc)
-            _debug("openai_client_init_failed", error=exc)
-    return _openai_client
+            logger.warning("Embedding client init failed: %s", exc)
+            _debug("embedding_client_init_failed", error=exc)
+    return _embedding_client
 
 
 # ---------------------------------------------------------------------------
@@ -78,14 +117,21 @@ def _get_openai():
 
 async def _embed(text: str) -> list[float] | None:
     """Return an embedding vector or None on failure."""
-    client = _get_openai()
+    client = _get_embedding_client()
     if client is None:
-        _debug("embed_skipped_no_openai")
+        _debug("embed_skipped_no_embedding_client")
         return None
     try:
-        response = await client.embeddings.create(
-            input=[text], model=EMBEDDING_MODEL
-        )
+        provider, _, _ = _resolve_embedding_config()
+        request_kwargs: dict[str, Any] = {
+            "input": [text],
+            "model": EMBEDDING_MODEL,
+        }
+        if provider == "nvidia":
+            # NV-EmbedQA models are asymmetric and require an input_type.
+            request_kwargs["extra_body"] = {"input_type": "query"}
+
+        response = await client.embeddings.create(**request_kwargs)
         _debug("embed_ok", vector_size=len(response.data[0].embedding))
         return response.data[0].embedding
     except Exception as exc:
@@ -194,20 +240,60 @@ def _qdrant_search(
                 must=[FieldCondition(key="bias", match=MatchValue(value=bias_filter))]
             )
 
-        hits = client.search(
-            collection_name=QDRANT_COLLECTION,
-            query_vector=vector,
-            query_filter=flt,
-            limit=top_k,
-        )
-        citations = [
-            Citation(
-                case_id=h.payload.get("case_id", h.id),
-                summary=h.payload.get("summary", ""),
-                relevance_score=round(h.score, 3),
+        points: list[Any] = []
+
+        # qdrant-client API changed; use query_points when available.
+        if hasattr(client, "query_points"):
+            try:
+                response = client.query_points(
+                    collection_name=QDRANT_COLLECTION,
+                    query=vector,
+                    query_filter=flt,
+                    limit=top_k,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                points = list(getattr(response, "points", []) or [])
+            except Exception as exc:
+                # Some clusters require a payload index for filtered queries.
+                if bias_filter and "Index required but not found" in str(exc):
+                    _debug("qdrant_bias_index_missing_retry_unfiltered", error=exc)
+                    response = client.query_points(
+                        collection_name=QDRANT_COLLECTION,
+                        query=vector,
+                        limit=max(top_k * 4, 10),
+                        with_payload=True,
+                        with_vectors=False,
+                    )
+                    unfiltered = list(getattr(response, "points", []) or [])
+                    points = [
+                        point
+                        for point in unfiltered
+                        if (getattr(point, "payload", None) or {}).get("bias") == bias_filter
+                    ][:top_k]
+                else:
+                    raise
+        else:
+            hits = client.search(
+                collection_name=QDRANT_COLLECTION,
+                query_vector=vector,
+                query_filter=flt,
+                limit=top_k,
             )
-            for h in hits
-        ]
+            points = list(hits)
+
+        citations = []
+        for point in points:
+            payload = getattr(point, "payload", None) or {}
+            point_id = getattr(point, "id", None)
+            score = float(getattr(point, "score", 0.0) or 0.0)
+            citations.append(
+                Citation(
+                    case_id=payload.get("case_id", str(point_id) if point_id is not None else "unknown"),
+                    summary=payload.get("summary", ""),
+                    relevance_score=round(score, 3),
+                )
+            )
         _debug(
             "qdrant_search",
             collection=QDRANT_COLLECTION,
@@ -244,15 +330,17 @@ async def retrieve_precedents_with_trace(
     Retrieve legal precedents relevant to *query* for the given *role*.
 
     Strategy:
-      1. Try semantic search via OpenAI embeddings + Qdrant.
+      1. Try semantic search via configured embeddings provider + Qdrant.
       2. Fall back to keyword search over the built-in demo bank.
     """
     bias_filter = _BIAS_MAP.get(role)
+    provider, key, _ = _resolve_embedding_config()
     _debug(
         "retrieve_precedents_start",
         role=role,
         top_k=top_k,
-        has_openai_key=bool(OPENAI_API_KEY),
+        embedding_provider=(provider or "none"),
+        has_embedding_key=bool(key),
         qdrant_collection=QDRANT_COLLECTION,
     )
 
@@ -303,11 +391,20 @@ async def retrieve_precedents_with_trace(
 
 def rag_diagnostics() -> dict[str, Any]:
     """Return current RAG runtime diagnostics for debugging."""
+    provider, key, base_url = _resolve_embedding_config()
+
     diagnostics: dict[str, Any] = {
-        "openai_api_key_set": bool(OPENAI_API_KEY),
+        "embedding_provider_configured": EMBEDDING_PROVIDER,
+        "embedding_provider_effective": provider or "none",
         "embedding_model": EMBEDDING_MODEL,
+        "embedding_key_set": bool(key),
+        "openai_api_key_set": bool(OPENAI_API_KEY),
+        "nvidia_api_key_set": bool(NVIDIA_API_KEY),
+        "embedding_base_url": (base_url or "openai-default") if provider else None,
+        "embedding_client_provider": _embedding_client_provider,
         "qdrant_url": QDRANT_URL,
         "qdrant_collection": QDRANT_COLLECTION,
+        "qdrant_vector_size": QDRANT_VECTOR_SIZE,
         "qdrant_api_key_set": bool(QDRANT_API_KEY),
         "qdrant_client_available": False,
         "collection_exists": False,
