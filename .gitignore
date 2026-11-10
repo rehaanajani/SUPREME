@@ -13,6 +13,7 @@ supreme-backend/data/sessions.db
 # ── Node / Frontend ───────────────────────────────────────────────────────────
 node_modules/
 dist/
+.vite/
 .DS_Store
 supreme-frontend/.env
 
