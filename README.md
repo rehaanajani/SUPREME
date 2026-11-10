@@ -118,3 +118,7 @@ VITE_VAPI_API_KEY=...
 - ✂️ **Redact** — Strike entries from the record mid-trial
 - ⚡ **Fast-forward** — Skip to the verdict instantly
 - 🧠 **RAG** — Qdrant-powered retrieval of legal precedents
+
+## License
+
+MIT. See [LICENSE](LICENSE).
